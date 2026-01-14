@@ -222,6 +222,7 @@ type Protocol struct {
 	S3SecretKey      string // general, mediaserver configuration
 	S3ForcePathStyle bool   // general, mediaserver configuration
 	S3Presign        bool   // general, mediaserver configuration
+	MakeItCreepy     bool   // general, mediaserver configuration
 }
 
 type ChannelOptions struct {

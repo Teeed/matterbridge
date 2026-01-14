@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1" //nolint:gosec
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -53,6 +54,8 @@ type s3MediaServer struct {
 	bucket             string
 	uploadPrefix       string
 	httpDownloadPrefix string
+
+	makeItCreepy bool
 }
 
 var _ mediaServer = (*httpPutMediaServer)(nil)
@@ -127,6 +130,7 @@ func createS3MediaServer(bg *config.BridgeValues, bucketName string, uploadPrefi
 		bucket:             bucketName,
 		uploadPrefix:       uploadPrefix,
 		httpDownloadPrefix: bg.General.MediaServerDownload,
+		makeItCreepy:       bg.General.MakeItCreepy,
 	}, nil
 }
 
@@ -271,6 +275,36 @@ func (h *s3MediaServer) handleFilesUpload(fi *config.FileInfo) (string, error) {
 		"etag":        info.ETag,
 		"downloadURL": downloadURL,
 	}).Debug("successfully uploaded")
+
+	if h.makeItCreepy {
+		// Make the URL creepy
+		body, err := json.Marshal(map[string]string{
+			"url": downloadURL,
+		})
+		if err != nil {
+			return "", fmt.Errorf("%w: could not marshal json: %w", errUploadFailed, err)
+		}
+		resp, err := http.Post("https://creepylink.com/shorten", "application/json", bytes.NewReader(body))
+		if err != nil {
+			return "", fmt.Errorf("%w: could not make creepy url: %w", errUploadFailed, err)
+		}
+		defer func() {
+			err := resp.Body.Close()
+			if err != nil {
+				h.logger.WithError(err).Error("failed to close response body")
+			}
+		}()
+
+		var respData struct {
+			ShortUrl string `json:"shortUrl"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&respData)
+		if err != nil {
+			return "", fmt.Errorf("%w: could not decode creepy url response: %w", errUploadFailed, err)
+		}
+
+		downloadURL = respData.ShortUrl
+	}
 
 	return downloadURL, nil
 }
