@@ -1,0 +1,2 @@
+[registry."docker.v.teeed.eu"]
+ca=["/home/teeed/.docker/certs.d/docker.v.teeed.eu/ca.crt"]
