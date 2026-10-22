@@ -3,6 +3,30 @@
 > [!TIP]
 > This page contains the details about matrix settings. More general information about matrix support in matterbridge can be found in [README.md](README.md).
 
+## DeviceID
+
+The device id use when logging in with MxID.
+
+Unless this option is set, the Matrix client is unencrypted and MxID based login won't work.
+
+- Setting: **OPTIONAL**
+- Format: *string*
+- Example:
+  ```toml
+  DeviceID="yourdeviceid"
+  ```
+
+## DisableMarkdownParsing
+
+By default, Matterbridge uses [goldmark](https://github.com/yuin/goldmark) to parse markdown before passing it off to the formatted body. One may wish to override this with their own tengo script or simply disable it if the other end of their setup doesn't even use markdown (e.g. XMPP). Defaults to false for compatibility.
+
+- Setting: **OPTIONAL**, **RELOADABLE**
+- Format: *boolean*
+- Example:
+  ```toml
+  DisableMarkdownParsing=true
+  ```
+
 ## HTMLDisable
 
 Whether to disable sending of HTML content to matrix
@@ -23,9 +47,22 @@ Messages sent from this user will not be relayed to avoid loops.
 
 - Setting: **REQUIRED**
 - Format: *string*
-- Example: 
+- Example:
   ```toml
   Login="yourlogin"
+  ```
+
+## MxID
+
+MxID of your bot.
+Use a dedicated user for this and not your own!
+Messages sent from this user will not be relayed to avoid loops.
+
+- Setting: **REQUIRED**
+- Format: *string*
+- Example:
+  ```toml
+  MxID="@yourbot:example.net"
   ```
 
 ## NoHomeServerSuffix
@@ -46,9 +83,35 @@ password of your bot.
 
 - Setting: **REQUIRED**
 - Format: *string*
-- Example: 
+- Example:
   ```toml
   Password="yourpass"
+  ```
+
+## PickleKey
+
+The key to use when accessing E2EE encryption in an encryption database.
+
+Unless this option is set, the Matrix client is unencrypted.
+
+- Setting: **OPTIONAL**
+- Format: *string*
+- Example:
+  ```toml
+  Password="yourpicklekey"
+  ```
+
+## RecoveryKey
+
+The key to use when accessing E2EE encryption in an encryption database.
+
+Unless this option is set, the Matrix client won't be verified for encryption.
+
+- Setting: **OPTIONAL**
+- Format: *string*
+- Example:
+  ```toml
+  RecoveryKey="yourrecoverykey"
   ```
 
 ## Server
@@ -57,9 +120,22 @@ Server is your homeserver (eg https://matrix.org)
 
 - Setting: **REQUIRED**
 - Format: *string*
-- Example: 
+- Example:
   ```toml
   Server="https://matrix.org"
+  ```
+
+## SessionFile
+
+The database file to use when accessing E2EE encryption in an encryption database.
+
+Unless this option is set, the Matrix client is unencrypted.
+
+- Setting: **OPTIONAL**
+- Format: *string*
+- Example:
+  ```toml
+  SessionFile="yourdatabasefile.db"
   ```
 
 ## UseUserName
@@ -71,4 +147,39 @@ Shows the username instead of the displayname
 - Example:
   ```toml
   UseUserName=true
+  ```
+
+## KeepQuotedReply
+
+Matrix quotes replies and as of matterbridge 1.24.0 we strip those as this causes issues with bridges support threading and have PreserveThreading enabled.
+
+But if you for example use mattermost or discord with webhooks you'll need to enable this (and keep PreserveThreading disabled) if you want something that looks like a reply from Matrix. See issues [42wim/#1819](https://github.com/42wim/matterbridge/issues/1819) and [42wim/#1780](https://github.com/42wim/matterbridge/issues/1780).
+
+- Setting: **OPTIONAL**, **RELOADABLE**
+- Format: *boolean*
+- Example:
+  ```toml
+  KeepQuotedReply=false
+  ```
+
+## SpoofUsername
+
+Rename the bot in the current room to the username of the message. This will make an additional API request per message and will probably count towards rate limits.
+
+- Setting: **OPTIONAL**, **RELOADABLE**
+- Format: *boolean*
+- Example:
+  ```toml
+  SpoofUsername=false
+  ```
+
+## UseMSC4144
+
+Use MSC4144 to set nick per-message. See https://github.com/matrix-org/matrix-spec-proposals/pull/4144. At the moment this is an open proposal and is subject to change. Clients that don't support this will display e.g. `Nick: msg` with the nick in bold.
+
+- Setting: **OPTIONAL**, **RELOADABLE**
+- Format: *boolean*
+- Example:
+  ```toml
+  UseMSC4144=true
   ```

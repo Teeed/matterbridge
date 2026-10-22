@@ -1,10 +1,11 @@
+<!-- TODO: check matterbridge.toml.sample and see whether this is accurate. ive seen some settings from there undocumented for various protocols -->
 # Settings
 
 On this page you will find information about global matterbridge settings. Most of these settings can be applied to specific gateways, and those marked **GENERAL** can be placed in the `[general]` configuration dictionary for setting it across all gateways.
 
 > [!TIP]
 > Settings specific to a certain protocol can be found in the corresponding folder in the
-> [protocols/](protocols/) documentation folder. API settings for can be found in the
+> [protocols/](protocols/) documentation folder. API settings can be found in the
 > [api/](api/) documentation folder.
 
 # Info
@@ -35,9 +36,19 @@ Example:
 
 `EditSuffix=" (edited)"`
 
+## EditMaxDays
+Edits of messages older than this number of days are ignored. The default of 0 disables this.
+So far only works for discord.
+
+Setting: OPTIONAL, RELOADABLE \
+Format: int \
+Example: ignore edits of messages older than 2 weeks
+
+`EditMaxDays=14`
+
 ## IgnoreMessages
 Messages you want to ignore.\
-Messages matching these regexp will be ignored and not sent to other bridges.\
+Messages matching these regex will be ignored and not sent to other bridges.\
 See https://regex-golang.appspot.com/assets/html/index.html for more regex info.
 
 Setting: OPTIONAL, RELOADABLE, ALL \
@@ -66,7 +77,7 @@ Example: add the label `mychat`
 `Label="mychat"`
 
 ## PrefixMessagesWithNick
-Whether to prefix messages from other bridges to with the sender's nick.
+Whether to prefix messages from other bridges with the sender's nick.
 Useful if username overrides for incoming webhooks isn't enabled.
  If you set PrefixMessagesWithNick to true, each message
 from other bridges will by default be prefixed by "bridge-" + nick. You can,
@@ -110,7 +121,7 @@ Example: this replaces cat => dog and sleep => awake
 
 ## ReplaceNicks
 Nicks you want to replace. \
-See `ReplaceMessages` for syntax
+See `ReplaceMessages` for the syntax
 
 Setting: OPTIONAL, RELOADABLE, ALL \
 Format: [ ["from1","to1"],["from2","to2"] ] \
@@ -188,7 +199,7 @@ Example: enable it
 ## LogFile
 
 LogFile defines the location of a file to write logs into, rather than stdout.
-Logging will still happen on stdout if the file cannot be open for #writing, or if the value is empty. 
+Logging will still happen on stdout if the file cannot be opened for #writing, or if the value is empty. 
 Note that the log won't roll, so you might want to use logrotate(8) with this feature.
 
 Setting: OPTIONAL, GENERAL \
@@ -199,7 +210,7 @@ Example:
 
 ## MediaDownloadBlacklist 
 Allows you to blacklist specific files from being downloaded.
-Filenames matching these regexp will not be download/uploaded to the mediaserver. \
+Filenames matching these regex will not be download/uploaded to the mediaserver. \
 You can use regex for this, see https://regex-golang.appspot.com/assets/html/index.html for more regex info
 
 Setting: OPTIONAL, RELOADABLE, GENERAL \
@@ -209,9 +220,7 @@ Example: do not upload html and htm extension
 `MediaDownloadBlacklist=[".html$",".htm$"]`
 
 ## MediaDownloadPath
-MediaDownloadPath is the filesystem path where the media file will be placed, instead of uploaded, for if Matterbridge has write access to the directory your webserver is serving. \
-It is an alternative to MediaServerUpload.
-More information https://github.com/42wim/matterbridge/wiki/Mediaserver-setup-%28advanced%29
+MediaDownloadPath is the filesystem path where the media file will be placed, instead of uploaded, if Matterbridge has write access to the directory your webserver is serving. [More information](https://github.com/matterbridge-org/matterbridge/blob/master/docs/advanced/mediaserver.md)
 
 Setting: OPTIONAL, RELOADABLE, GENERAL \
 Format: string \
@@ -220,11 +229,12 @@ Example:
 `MediaDownloadPath="/srv/http/yourserver.com/public/download"`
 
 ## MediaDownloadSize
-Maximum size in bytes matterbridge will download for use with (`MediaServerUpload` and `MediaDownloadPath`)
+Maximum size in bytes matterbridge will download for use with upload to the
+media server or to other bridges.
 
 Setting: OPTIONAL, RELOADABLE, GENERAL \
 Format: int \
-Default: 10000000 (1 megabyte) \
+Default: 1000000 (1 megabyte) \
 Example:
 
 `MediaDownloadSize=1000000`
@@ -240,19 +250,3 @@ Format: string \
 Example: 
 
 `MediaServerDownload="https://youserver.com/download"`
-
-
-## MediaServerUpload 
-Used for uploading images/files/video to a remote "mediaserver" (a webserver like caddy for example). \
-When configured images/files uploaded on bridges like mattermost, slack, telegram will be
-downloaded and uploaded again to MediaServerUpload URL.
-More information https://github.com/42wim/matterbridge/wiki/Mediaserver-setup-%28advanced%29
-
-Setting: OPTIONAL, RELOADABLE, GENERAL \
-Format: string \
-Example: 
-
-`MediaServerUpload="https://user:pass@yourserver.com/upload"`
-
-## RemoteNickFormat 
-See [RemoteNickFormat](#RemoteNickFormat)

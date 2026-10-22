@@ -14,7 +14,7 @@ Letting people be where they want to be with the magic of [interoperability](htt
 
 ---
 
-[![Download stable](https://img.shields.io/github/release/42wim/matterbridge.svg?label=download%20stable)](https://github.com/42wim/matterbridge/releases/latest)
+[![Download stable](https://img.shields.io/github/release/42wim/matterbridge.svg?label=download%20stable)](https://github.com/matterbridge-org/matterbridge/releases/latest)
 
 ---
 
@@ -55,19 +55,32 @@ See [docs/](docs/) folder in this repository.
 
 ## Contributing
 
-This project is licensed under the Apache License 2.0. A copy can be found in the [LICENSE](LICENSE) file in this repository.
-
 You are welcome to submit pull requests, report bugs and request new features. matterbridge is a volunteer-run project and you are expected to behave with respect for the maintainers and other users. In particular, harassment and hate speech are not welcome.
 
 For more development guidelines, see [docs/development/](docs/development/).
 
+### Version policy
+
+matterbridge requires go 1.26. The required go version may be bumped at any time, but we will always wait at least 1 month after a golang release before bumping our requirements.
+
+While we would like to support older golang releases in order to target older distros, the problem is we have many upstream dependencies with many different versioning policies. go has no LTS version, and promises backwards-compatibility. See [this issue](https://github.com/matterbridge-org/matterbridge/issues/203) for more discussion on the topic.
+
+Please note it is still possible to compile matterbridge on stable distros such as Debian stable, just not with the distro-packaged compiler. You will need to use official golang binaries, or nix/guix packages, etc.
+
+### License
+
+This project is licensed under the [GNU AGPLv3 license](LICENSE) since after commit `20988f6446c6ad3ea416044712e634d3ed85ee53`. It was relicensed following discussion in [commmunity/#10](https://github.com/matterbridge-org/community/issues/10). Apart from the obvious advantages of copyleft to promote innovation and cooperation, in very practical terms, we had to use either `GPL` or `AGPL` to include the `whatsappmulti` bridge in official builds and deprecate the broken legacy `whatsapp` bridge. When contributing to matterbridge development, you agree that your contributions will be published under that license.
+
+Commits up-to `20988f6446c6ad3ea416044712e634d3ed85ee53` remain available under the looser [Apache License 2.0](LICENSE.old). 
+
 ### Chat with us
 
-Questions or want to test on your favorite platform? Join us on:
+Questions or want to see the bridge in action? Join us on:
 
 - federated networks: [Jabber/XMPP][mb-xmpp], [Matrix][mb-matrix]
-- non-free centralized networks: [Discord][mb-discord], [Keybase][mb-keybase], [Slack][mb-slack], [Telegram][mb-telegram], [Twitch][mb-twitch]
-- self-hostable centralized networks: [IRC][mb-irc], [Mattermost][mb-mattermost], [Rocket.Chat][mb-rocketchat], [Zulip][mb-zulip]
+- non-free centralized networks: [Discord][mb-discord]
+- self-hostable centralized networks: #matterbridge on `irc.f-hub.org:6697` or [Libera.chat][mb-irc]
+- Other: [Telegram](https://t.me/Matterbridge)
 
 ## Related projects
 
@@ -76,7 +89,6 @@ Questions or want to test on your favorite platform? Join us on:
 - [matterbridge config viewer](https://github.com/patcon/matterbridge-heroku-viewer)
 - [matterbridge-heroku](https://github.com/cadecairos/matterbridge-heroku)
 - [mattermost-plugin](https://github.com/matterbridge/mattermost-plugin) - Run matterbridge as a plugin in mattermost
-- [isla](https://github.com/alphachung/isla) (Bot for Discord-Telegram groups used alongside matterbridge)
 
 ## Thanks
 
@@ -84,18 +96,7 @@ Matterbridge wouldn't exist without amazing libraries, without [@42wim](https://
 
 <!-- Links -->
 
-[mb-discord]: https://discord.gg/AkKPtrQ
-[mb-gitter]: https://gitter.im/42wim/matterbridge
+[mb-discord]: https://discord.gg/c9Ht6UTnQU
 [mb-irc]: https://web.libera.chat/#matterbridge
-[mb-keybase]: https://keybase.io/team/matterbridge
-[mb-matrix]: https://riot.im/app/#/room/#matterbridge:matrix.org
-[mb-mattermost]: https://framateam.org/signup_user_complete/?id=tfqm33ggop8x3qgu4boeieta6e
-[mb-msteams]: https://teams.microsoft.com/join/hj92x75gd3y7
-[mb-rocketchat]: https://open.rocket.chat/channel/matterbridge
-[mb-slack]: https://join.slack.com/t/matterbridgechat/shared_invite/zt-2ourq2h2-7YvyYBq2WFGC~~zEzA68_Q
-[mb-telegram]: https://t.me/Matterbridge
-[mb-twitch]: https://www.twitch.tv/matterbridge
-[mb-whatsapp]: https://www.whatsapp.com/
-[mb-xmpp]: xmpp:matterbridge@conference.jabber.de?join
-[mb-zulip]: https://matterbridge.zulipchat.com/register/
-
+[mb-matrix]: https://matrix.to/#/#matterbridge:matrix.f-hub.org
+[mb-xmpp]: xmpp:matterbridge@chat.f-hub.org?join

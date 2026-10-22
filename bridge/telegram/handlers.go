@@ -11,6 +11,7 @@ import (
 	"github.com/davecgh/go-spew/spew"
 	"github.com/matterbridge-org/matterbridge/bridge/config"
 	"github.com/matterbridge-org/matterbridge/bridge/helper"
+
 	// Seems not much different from upstream https://github.com/go-telegram-bot-api/telegram-bot-api replace?
 	tgbotapi "github.com/matterbridge/telegram-bot-api/v6"
 )
@@ -146,7 +147,7 @@ func (b *Btelegram) handleUsername(rmsg *config.Message, message *tgbotapi.Messa
 			}
 		}
 		// only download avatars if we have a place to upload them (configured mediaserver)
-		if b.General.MediaServerUpload != "" || (b.General.MediaServerDownload != "" && b.General.MediaDownloadPath != "") {
+		if b.General.MediaServerDownload != "" && b.General.MediaDownloadPath != "" {
 			b.handleDownloadAvatar(message.From.ID, rmsg.Channel)
 		}
 	}
@@ -170,7 +171,7 @@ func (b *Btelegram) handleUsername(rmsg *config.Message, message *tgbotapi.Messa
 			}
 		}
 		// only download avatars if we have a place to upload them (configured mediaserver)
-		if b.General.MediaServerUpload != "" || (b.General.MediaServerDownload != "" && b.General.MediaDownloadPath != "") {
+		if b.General.MediaServerDownload != "" && b.General.MediaDownloadPath != "" {
 			b.handleDownloadAvatar(message.SenderChat.ID, rmsg.Channel)
 		}
 	}
@@ -204,7 +205,7 @@ func (b *Btelegram) handleRecv(updates <-chan tgbotapi.Update) {
 
 		var message *tgbotapi.Message
 
-		rmsg := config.Message{Account: b.Account, Extra: make(map[string][]interface{})}
+		rmsg := config.Message{Account: b.Account, Extra: make(map[string][]any)}
 
 		// handle channels
 		message = b.handleChannels(&rmsg, message, update)
@@ -280,11 +281,11 @@ func (b *Btelegram) handleUserJoin(update tgbotapi.Update) {
 	for _, user := range msg.NewChatMembers {
 		rmsg := config.Message{
 			UserID:   strconv.FormatInt(user.ID, 10),
-			Username: user.FirstName, // for some reason all the other name felids are empty on this event (at least for me)
+			Username: user.FirstName, // for some reason all the other name fields are empty on this event (at least for me)
 			Channel:  strconv.FormatInt(msg.Chat.ID, 10),
 			Account:  b.Account,
 			Protocol: b.Protocol,
-			Event:    config.EventJoinLeave,
+			Event:    config.EventJoin,
 			Text:     "joined chat",
 		}
 		b.Remote <- rmsg
@@ -297,11 +298,11 @@ func (b *Btelegram) handleUserLeave(update tgbotapi.Update) {
 
 	rmsg := config.Message{
 		UserID:   strconv.FormatInt(user.ID, 10),
-		Username: user.FirstName, // for some reason all the other name felids are empty on this event (at least for me)
+		Username: user.FirstName, // for some reason all the other name fields are empty on this event (at least for me)
 		Channel:  strconv.FormatInt(msg.Chat.ID, 10),
 		Account:  b.Account,
 		Protocol: b.Protocol,
-		Event:    config.EventJoinLeave,
+		Event:    config.EventLeave,
 		Text:     "left chat",
 	}
 
@@ -319,7 +320,7 @@ func (b *Btelegram) handleDownloadAvatar(userid int64, channel string) {
 		Account:  b.Account,
 		UserID:   strconv.FormatInt(userid, 10),
 		Event:    config.EventAvatarDownload,
-		Extra:    make(map[string][]interface{}),
+		Extra:    make(map[string][]any),
 	}
 
 	if _, ok := b.avatarMap[strconv.FormatInt(userid, 10)]; ok {
@@ -511,7 +512,48 @@ func (b *Btelegram) handleEdit(msg *config.Message, chatid int64) (string, error
 
 // handleUploadFile handles native upload of files
 func (b *Btelegram) handleUploadFile(msg *config.Message, chatid int64, threadid int, parentID int) (string, error) {
-	var media []interface{}
+	var media []any
+	equal := true
+	first := true
+	var prev string
+
+	for _, f := range msg.Extra["file"] {
+		fi, ok := f.(config.FileInfo)
+		if !ok {
+			continue
+		}
+
+		var ftype string
+
+		switch filepath.Ext(fi.Name) {
+		case ".jpg", ".jpe", ".png":
+			ftype = "image"
+		case ".mp4", ".m4v":
+			ftype = "video"
+		case ".mp3", ".oga", ".ogg", ".opus", ".flac":
+			ftype = "audio"
+		default:
+			ftype = "document"
+		}
+
+		if ftype == "document" {
+			equal = false
+			break
+		}
+
+		if first {
+			prev = ftype
+			equal = true
+			first = false
+		} else {
+			if prev != ftype {
+				equal = false
+				break
+			}
+			prev = ftype
+		}
+	}
+
 	for _, f := range msg.Extra["file"] {
 		fi := f.(config.FileInfo)
 		file := tgbotapi.FileBytes{
@@ -521,6 +563,15 @@ func (b *Btelegram) handleUploadFile(msg *config.Message, chatid int64, threadid
 
 		if b.GetString("MessageFormat") == HTMLFormat {
 			fi.Comment = makeHTML(html.EscapeString(fi.Comment))
+		}
+
+		if !equal {
+			dc := tgbotapi.NewInputMediaDocument(file)
+			if fi.Comment != "" {
+				dc.Caption, dc.ParseMode = TGGetParseMode(b, msg.Username, fi.Comment)
+			}
+			media = append(media, dc)
+			continue
 		}
 
 		switch filepath.Ext(fi.Name) {
@@ -536,21 +587,13 @@ func (b *Btelegram) handleUploadFile(msg *config.Message, chatid int64, threadid
 				vc.Caption, vc.ParseMode = TGGetParseMode(b, msg.Username, fi.Comment)
 			}
 			media = append(media, vc)
-		case ".mp3", ".oga":
+		case ".mp3", ".oga", ".ogg", ".opus", ".flac":
 			ac := tgbotapi.NewInputMediaAudio(file)
 			if fi.Comment != "" {
 				ac.Caption, ac.ParseMode = TGGetParseMode(b, msg.Username, fi.Comment)
 			}
+			ac.Caption = fi.Name
 			media = append(media, ac)
-		case ".ogg":
-			voc := tgbotapi.NewVoice(chatid, file)
-			voc.Caption, voc.ParseMode = TGGetParseMode(b, msg.Username, fi.Comment)
-			voc.ReplyToMessageID = parentID
-			res, err := b.c.Send(voc)
-			if err != nil {
-				return "", err
-			}
-			return strconv.Itoa(res.MessageID), nil
 		default:
 			dc := tgbotapi.NewInputMediaDocument(file)
 			if fi.Comment != "" {

@@ -4,6 +4,10 @@
 - Maintainers: ???
 - Features: ???
 
+> [!INFO]
+> 
+> As of 2026, this is the new default whatsapp bridge implementation, based on the [whatsmeow](https://github.com/tulir/whatsmeow) library. This backend was previously known as `whatsappmulti`, but has been renamed `whatsapp`. You do not need to change your settings: they will still use the `whatsapp` config key.
+
 ## Configuration
 
 > [!TIP]
@@ -17,9 +21,7 @@ RemoteNickFormat="[{PROTOCOL}] @{NICK}: "
 # Get a disposable SIM card
 Number="+48111222333"
 # See FAQ
-SessionFile="session-48111222333.gob"
-# If your terminal uses a light color scheme, uncommebt below
-#QrOnWhiteTerminal=true
+SessionFile="/usr/share/matterbridge/session-48111222333.gob"
 ```
 
 ## FAQ
@@ -30,7 +32,7 @@ The QR-Code is created by matterbridge on the terminal: It's the way WhatsApp au
 
 ![](https://user-images.githubusercontent.com/8722846/64077252-ae3be180-ccce-11e9-812e-6e8a1e833346.png)
 
-### How to set the WA-channel in the configuration file of matterbridge? 
+### How to set the WA-channel in the configuration file of matterbridge?
 
 To setup a gateway between two protocols in matterbridge, you need to specify a channel for WA that should be bridged. The chat/group titles you see in WA won't work (e.g. from the screenshot above, "Test" won't work). Fortunately, matterbridge will complain about improper channel names and suggest the correct ones to you. In my case, it was a string of mainly numbers including the phone number of who created the group chat. Maybe there is a way to get this out of WA?
 (Currently, the WA example config does not explain this at all; it doesn't even mention the gateway part.)

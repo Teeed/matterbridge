@@ -30,6 +30,18 @@ permission.
   Token="YOUR_TOKEN_HERE"
   ```
 
+## CustomStatus
+
+Custom activity status message to set when connecting the bot to Discord. This
+will be shown in member lists on Discord, as well as the bot's profile.
+
+- Setting: **OPTIONAL**
+- Format: *string*
+- Example:
+  ```toml
+  CustomStatus="Bridging your chats"
+  ```
+
 ## AllowMention
 
 AllowMention controls which mentions are allowed.
@@ -58,6 +70,18 @@ Shows title, description and URL of embedded messages (sent by other bots)
 - Example:
   ```toml
   ShowEmbeds=true
+  ```
+
+## EmbedFormat
+
+Sets the format of the embeds attached to Discord messages sent by users (e.g. YouTube videos).
+The only available placeholders are `{TITLE}`, `{URL}` (a URL), `{DESCRIPTION}`, `{TIME}`, `{FOOTER}`, `{IMAGE}` (a URL), `{THUMBNAIL}` (a URL), `{VIDEO}` (a URL), `{PROVIDER}` (a URL), `{AUTHOR}`, and `{AUTHORURL}` (a URL). If a parameter isn't in the originating embed it is simply omitted. (e.g. `Hello {AUTHOR}!` becomes `Hello !` if there is no author)
+
+- Setting: **OPTIONAL** (default `" embed: {TITLE} - {DESCRIPTION} - {URL}"`), **RELOADABLE**
+- Format: *string*
+- Example:
+  ```toml
+  EmbedFormat="\n# {TITLE} ({URL}) by {AUTHOR} ({AUTHORURL})\n{DESCRIPTION}\n{TIME}\n{FOOTER}"
   ```
 
 ## UseUserName
@@ -95,7 +119,8 @@ for each gateway and not in the account configuration.
 - Format: *string*
 - Example:
   ```toml
-  `WebhookURL="Yourwebhooktokenhere"` 
+  WebhookURL="Yourwebhooktokenhere"
+  ```
 
 ## AutoWebhooks
 
@@ -111,4 +136,42 @@ Setting: OPTIONAL \
 Format: boolean \
 Example:
 
-`AutoWebhooks=true`
+  ```toml
+  AutoWebhooks=true
+  ```
+
+## QuoteDisable
+
+Disable quotes in reply messages. Disable if your destination bridges understand native replies.
+
+- Setting: **OPTIONAL**, **RELOADABLE**
+- Format: *boolean*
+- Example:
+  ```toml
+  QuoteDisable=true
+  ```
+
+## QuoteFormat
+
+Format quoted/reply messages
+
+- Setting: **OPTIONAL**, **RELOADABLE**
+- Format: *string*
+- Default: `"{MESSAGE} (re @{QUOTENICK}: {QUOTEMESSAGE})"`
+- Example:
+  ```toml
+  QuoteFormat="{@{QUOTENICK}, {MESSAGE}}"
+  ```
+
+## QuoteLengthLimit
+
+Limits {QUOTEMESSAGE} into integer characters specified in this.
+
+TODO: does this cut graphemes or bytes?
+
+- Setting: **OPTIONAL**
+- Format: *int*
+- Example:
+  ```toml
+  QuoteLengthLimit=46
+  ```

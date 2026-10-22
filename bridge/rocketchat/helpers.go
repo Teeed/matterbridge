@@ -2,7 +2,7 @@ package brocketchat
 
 import (
 	"context"
-	"io/ioutil"
+	"io"
 	"mime"
 	"net/http"
 	"net/url"
@@ -14,6 +14,7 @@ import (
 	"github.com/matterbridge-org/matterbridge/hook/rockethook"
 	"github.com/matterbridge-org/matterbridge/matterhook"
 	"github.com/nelsonken/gomf"
+
 	// Library even upstream no longer actively maintained, should be replaced:
 	"github.com/matterbridge/Rocket.Chat.Go.SDK/models"
 	"github.com/matterbridge/Rocket.Chat.Go.SDK/realtime"
@@ -137,7 +138,8 @@ func (b *Brocketchat) uploadFile(fi *config.FileInfo, channel string) error {
 		return err
 	}
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
@@ -160,14 +162,13 @@ func (b *Brocketchat) sendWebhook(msg *config.Message) error {
 	if msg.Extra != nil {
 		// this sends a message only if we received a config.EVENT_FILE_FAILURE_SIZE
 		for _, rmsg := range helper.HandleExtra(msg, b.General) {
-			rmsg := rmsg // scopelint
 			iconURL := config.GetIconURL(&rmsg, b.GetString("iconurl"))
 			matterMessage := matterhook.OMessage{
 				IconURL:  iconURL,
 				Channel:  rmsg.Channel,
 				UserName: rmsg.Username,
 				Text:     rmsg.Text,
-				Props:    make(map[string]interface{}),
+				Props:    make(map[string]any),
 			}
 			if err := b.mh.Send(matterMessage); err != nil {
 				b.Log.Errorf("sendWebhook failed: %s ", err)

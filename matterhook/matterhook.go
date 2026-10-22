@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -19,14 +18,14 @@ import (
 
 // OMessage for mattermost incoming webhook. (send to mattermost)
 type OMessage struct {
-	Channel     string                 `json:"channel,omitempty"`
-	IconURL     string                 `json:"icon_url,omitempty"`
-	IconEmoji   string                 `json:"icon_emoji,omitempty"`
-	UserName    string                 `json:"username,omitempty"`
-	Text        string                 `json:"text"`
-	Attachments []slack.Attachment     `json:"attachments,omitempty"`
-	Type        string                 `json:"type,omitempty"`
-	Props       map[string]interface{} `json:"props"`
+	Channel     string             `json:"channel,omitempty"`
+	IconURL     string             `json:"icon_url,omitempty"`
+	IconEmoji   string             `json:"icon_emoji,omitempty"`
+	UserName    string             `json:"username,omitempty"`
+	Text        string             `json:"text"`
+	Attachments []slack.Attachment `json:"attachments,omitempty"`
+	Type        string             `json:"type,omitempty"`
+	Props       map[string]any     `json:"props"`
 }
 
 // IMessage for mattermost outgoing webhook. (received from mattermost)
@@ -41,9 +40,9 @@ type IMessage struct {
 	Timestamp   string `schema:"timestamp"`
 	UserID      string `schema:"user_id"`
 	UserName    string `schema:"user_name"`
-	PostId      string `schema:"post_id"` //nolint:golint
+	PostId      string `schema:"post_id"`
 	RawText     string `schema:"raw_text"`
-	ServiceId   string `schema:"service_id"` //nolint:golint
+	ServiceId   string `schema:"service_id"`
 	Text        string `schema:"text"`
 	TriggerWord string `schema:"trigger_word"`
 	FileIDs     string `schema:"file_ids"`
@@ -52,7 +51,7 @@ type IMessage struct {
 // Client for Mattermost.
 type Client struct {
 	// URL for incoming webhooks on mattermost.
-	Url        string // nolint:golint
+	Url        string
 	In         chan IMessage
 	Out        chan OMessage
 	httpclient *http.Client
@@ -159,7 +158,10 @@ func (c *Client) Send(msg OMessage) error {
 	defer resp.Body.Close()
 
 	// Read entire body to completion to re-use keep-alive connections.
-	io.Copy(ioutil.Discard, resp.Body)
+	_, err = io.Copy(io.Discard, resp.Body)
+	if err != nil {
+		return err
+	}
 
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)

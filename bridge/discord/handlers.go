@@ -1,6 +1,9 @@
 package bdiscord
 
 import (
+	"strings"
+	"time"
+
 	"github.com/bwmarrin/discordgo"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/matterbridge-org/matterbridge/bridge/config"
@@ -72,7 +75,13 @@ func (b *Bdiscord) messageUpdate(s *discordgo.Session, m *discordgo.MessageUpdat
 		return
 	}
 	// only when message is actually edited
-	if m.Message.EditedTimestamp != nil {
+	if m.EditedTimestamp != nil {
+		// message must have been edited within EditMaxDays
+		// (there is a discord glitch where old message edits get sent without user interaction)
+		if b.GetInt("EditMaxDays") != 0 && time.Since(*m.EditedTimestamp) >= time.Duration(b.GetInt("EditMaxDays"))*24*time.Hour {
+			return
+		}
+
 		b.Log.Debugf("Sending edit message")
 		m.Content += b.GetString("EditSuffix")
 		msg := &discordgo.MessageCreate{
@@ -80,6 +89,45 @@ func (b *Bdiscord) messageUpdate(s *discordgo.Session, m *discordgo.MessageUpdat
 		}
 		b.messageCreate(s, msg)
 	}
+}
+
+func (b *Bdiscord) handleQuote(s *discordgo.Session, m *discordgo.Message, msg string) string {
+	if b.GetBool("QuoteDisable") {
+		return msg
+	}
+	if m.MessageReference == nil {
+		return msg
+	}
+	refMsgRef := m.MessageReference
+	refMsg, err := s.ChannelMessage(refMsgRef.ChannelID, refMsgRef.MessageID)
+	if err != nil {
+		b.Log.Errorf("Error getting quoted message %s:%s: %s", refMsgRef.ChannelID, refMsgRef.MessageID, err)
+		return msg
+	}
+
+	quoteMessage := refMsg.Content
+	quoteNick := refMsg.Author.Username
+	fromWebhook := m.WebhookID != ""
+	if !fromWebhook && b.GetBool("UseDiscriminator") {
+		quoteNick += "#" + refMsg.Author.Discriminator
+	}
+
+	format := b.GetString("quoteformat")
+	if format == "" {
+		format = "{MESSAGE} (re @{QUOTENICK}: {QUOTEMESSAGE})"
+	}
+	quoteMessagelength := len([]rune(quoteMessage))
+	if b.GetInt("QuoteLengthLimit") != 0 && quoteMessagelength >= b.GetInt("QuoteLengthLimit") {
+		runes := []rune(quoteMessage)
+		quoteMessage = string(runes[0:b.GetInt("QuoteLengthLimit")])
+		if quoteMessagelength > b.GetInt("QuoteLengthLimit") {
+			quoteMessage += "..."
+		}
+	}
+	format = strings.ReplaceAll(format, "{MESSAGE}", m.Content)
+	format = strings.ReplaceAll(format, "{QUOTENICK}", quoteNick)
+	format = strings.ReplaceAll(format, "{QUOTEMESSAGE}", quoteMessage)
+	return format
 }
 
 func (b *Bdiscord) messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) { //nolint:unparam
@@ -98,14 +146,7 @@ func (b *Bdiscord) messageCreate(s *discordgo.Session, m *discordgo.MessageCreat
 		return
 	}
 
-	// add the url of the attachments to content
-	if len(m.Attachments) > 0 {
-		for _, attach := range m.Attachments {
-			m.Content = m.Content + "\n" + attach.URL
-		}
-	}
-
-	rmsg := config.Message{Account: b.Account, Avatar: "https://cdn.discordapp.com/avatars/" + m.Author.ID + "/" + m.Author.Avatar + ".jpg", UserID: m.Author.ID, ID: m.ID}
+	rmsg := config.Message{Account: b.Account, Avatar: "https://cdn.discordapp.com/avatars/" + m.Author.ID + "/" + m.Author.Avatar + ".jpg", UserID: "@" + m.Author.Username, ID: m.ID, Extra: make(map[string][]any)} // here we use .jpg over .webp for wider support across bridges and clients in general. discord automatically converts as needed anyhow.
 
 	b.Log.Debugf("== Receiving event %#v", m.Message)
 
@@ -134,13 +175,8 @@ func (b *Bdiscord) messageCreate(s *discordgo.Session, m *discordgo.MessageCreat
 	// if we have embedded content add it to text
 	if b.GetBool("ShowEmbeds") && m.Message.Embeds != nil {
 		for _, embed := range m.Message.Embeds {
-			rmsg.Text += handleEmbed(embed)
+			rmsg.Text += b.handleEmbed(embed)
 		}
-	}
-
-	// no empty messages
-	if rmsg.Text == "" {
-		return
 	}
 
 	// do we have a /me action
@@ -153,14 +189,54 @@ func (b *Bdiscord) messageCreate(s *discordgo.Session, m *discordgo.MessageCreat
 	// Replace emotes
 	rmsg.Text = replaceEmotes(rmsg.Text)
 
+	// Handle Reply thread
+	rmsg.Text = b.handleQuote(s, m.Message, rmsg.Text)
+
 	// Add our parent id if it exists, and if it's not referring to a message in another channel
 	if ref := m.MessageReference; ref != nil && ref.ChannelID == m.ChannelID {
 		rmsg.ParentID = ref.MessageID
 	}
 
-	b.Log.Debugf("<= Sending message from %s on %s to gateway", m.Author.Username, b.Account)
-	b.Log.Debugf("<= Message is %#v", rmsg)
-	b.Remote <- rmsg
+	// no empty messages
+	if rmsg.Text == "" && len(m.Attachments) == 0 {
+		return
+	}
+
+	// if no attachments, send the message as-is
+	if len(m.Attachments) == 0 {
+		b.Log.Debugf("<= Sending message from %s on %s to gateway", m.Author.Username, b.Account)
+		b.Log.Debugf("<= Message is %#v", rmsg)
+
+		b.Remote <- rmsg
+
+		return
+	}
+
+	// We process attachments last, after all pre-processing is done
+	// Perform the operations in the background, so we can process other
+	// messages while we download the attachments.
+	go func() {
+		count := 0
+		for _, attach := range m.Attachments {
+			err := b.AddAttachmentFromURL(&rmsg, attach.Filename, attach.ID, "", attach.URL)
+			if err != nil {
+				b.Log.WithError(err).Warnf("Failed to download attachment %s", attach.Filename)
+				continue
+			}
+
+			count += 1
+		}
+
+		if rmsg.Text == "" && count == 0 {
+			b.Log.Warnf("Skipping message because there is no text and file uploads all failed")
+			return
+		}
+
+		b.Log.Debugf("<= Sending message attachments from %s on %s to gateway", m.Author.Username, b.Account)
+		b.Log.Debugf("<= Message is %#v", rmsg)
+
+		b.Remote <- rmsg
+	}()
 }
 
 func (b *Bdiscord) memberUpdate(s *discordgo.Session, m *discordgo.GuildMemberUpdate) {
@@ -213,7 +289,7 @@ func (b *Bdiscord) memberAdd(s *discordgo.Session, m *discordgo.GuildMemberAdd) 
 
 	rmsg := config.Message{
 		Account:  b.Account,
-		Event:    config.EventJoinLeave,
+		Event:    config.EventJoin,
 		Username: "system",
 		Text:     username + " joins",
 	}
@@ -241,7 +317,7 @@ func (b *Bdiscord) memberRemove(s *discordgo.Session, m *discordgo.GuildMemberRe
 
 	rmsg := config.Message{
 		Account:  b.Account,
-		Event:    config.EventJoinLeave,
+		Event:    config.EventLeave,
 		Username: "system",
 		Text:     username + " leaves",
 	}
@@ -250,27 +326,56 @@ func (b *Bdiscord) memberRemove(s *discordgo.Session, m *discordgo.GuildMemberRe
 	b.Remote <- rmsg
 }
 
-func handleEmbed(embed *discordgo.MessageEmbed) string {
-	var t []string
+func (b *Bdiscord) handleEmbed(embed *discordgo.MessageEmbed) string {
 	var result string
 
-	t = append(t, embed.Title)
-	t = append(t, embed.Description)
-	t = append(t, embed.URL)
+	result = b.GetString("EmbedFormat")
 
-	i := 0
-	for _, e := range t {
-		if e == "" {
-			continue
-		}
+	if result == "" {
+		result = " embed: {TITLE} - {DESCRIPTION} - {URL}"
+	}
 
-		i++
-		if i == 1 {
-			result += " embed: " + e
-			continue
-		}
+	result = strings.ReplaceAll(result, "{URL}", embed.URL)
+	result = strings.ReplaceAll(result, "{TITLE}", embed.Title)
+	result = strings.ReplaceAll(result, "{DESCRIPTION}", embed.Description)
+	result = strings.ReplaceAll(result, "{TIME}", embed.Timestamp)
 
-		result += " - " + e
+	if embed.Footer != nil {
+		result = strings.ReplaceAll(result, "{FOOTER}", embed.Footer.Text)
+	} else {
+		result = strings.ReplaceAll(result, "{FOOTER}", "")
+	}
+
+	if embed.Image != nil {
+		result = strings.ReplaceAll(result, "{IMAGE}", embed.Image.URL)
+	} else {
+		result = strings.ReplaceAll(result, "{IMAGE}", "")
+	}
+
+	if embed.Thumbnail != nil {
+		result = strings.ReplaceAll(result, "{THUMBNAIL}", embed.Thumbnail.URL)
+	} else {
+		result = strings.ReplaceAll(result, "{THUMBNAIL}", "")
+	}
+
+	if embed.Video != nil {
+		result = strings.ReplaceAll(result, "{VIDEO}", embed.Video.URL)
+	} else {
+		result = strings.ReplaceAll(result, "{VIDEO}", "")
+	}
+
+	if embed.Provider != nil {
+		result = strings.ReplaceAll(result, "{PROVIDER}", embed.Provider.URL)
+	} else {
+		result = strings.ReplaceAll(result, "{PROVIDER}", "")
+	}
+
+	if embed.Author != nil {
+		result = strings.ReplaceAll(result, "{AUTHOR}", embed.Author.Name)
+		result = strings.ReplaceAll(result, "{AUTHORURL}", embed.Author.URL)
+	} else {
+		result = strings.ReplaceAll(result, "{AUTHOR}", "")
+		result = strings.ReplaceAll(result, "{AUTHORURL}", "")
 	}
 
 	if result != "" {

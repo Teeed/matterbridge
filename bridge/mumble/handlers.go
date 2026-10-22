@@ -50,7 +50,8 @@ func (b *Bmumble) handleTextMessage(event *gumble.TextMessageEvent) {
 				fileExt = ".jpg"
 			}
 			fname := b.Account + "_" + strconv.FormatInt(now.UnixNano(), 10) + "_" + strconv.Itoa(i) + fileExt
-			rmsg.Extra = make(map[string][]interface{})
+
+			rmsg.Extra = make(map[string][]any)
 			if err = helper.HandleDownloadSize(b.Log, &rmsg, fname, int64(len(part.Image)), b.General); err != nil {
 				b.Log.WithError(err).Warn("not including image in message")
 				continue
@@ -118,12 +119,22 @@ func (b *Bmumble) handleJoinLeave(event *gumble.UserChangeEvent) {
 	}
 
 	if text != "" {
-		b.Remote <- config.Message{
-			Username: "system",
-			Text:     event.User.Name + text,
-			Channel:  strconv.FormatUint(uint64(*b.Channel), 10),
-			Account:  b.Account,
-			Event:    config.EventJoinLeave,
+		if text == " joined" {
+			b.Remote <- config.Message{
+				Username: "system",
+				Text:     event.User.Name + text,
+				Channel:  strconv.FormatUint(uint64(*b.Channel), 10),
+				Account:  b.Account,
+				Event:    config.EventJoin,
+			}
+		} else {
+			b.Remote <- config.Message{
+				Username: "system",
+				Text:     event.User.Name + text,
+				Channel:  strconv.FormatUint(uint64(*b.Channel), 10),
+				Account:  b.Account,
+				Event:    config.EventLeave,
+			}
 		}
 	}
 }

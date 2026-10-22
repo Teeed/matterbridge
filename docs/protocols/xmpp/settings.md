@@ -48,16 +48,44 @@ Your nick in the rooms
   Nick="xmppbot"
   ```
 
-## NoTLS
+## NoTLS (DEPRECATED)
 
-Enable this to make an insecure plaintext connection to your xmpp server.
-This is usually not permitted by XMPP servers even on localhost.
+> [!WARNING]
+> This setting has been deprecated. matterbridge will refuse to start if you are using it.
+> You should use the new `UseDirectTls` and `NoStartTls` settings instead.
 
 - Setting: **OPTIONAL**
 - Format: *boolean*
 - Example:
   ```toml
   NoTLS=true
+  ```
+
+## UseDirectTLS
+
+Enables direct TLS connection to your server. Most servers by default only support StartTLS,
+so this option should only be enabled if you know what you are doing. When `UseDirectTLS` is
+not set, and `NoStartTls` is enabled, a plaintext connection is established, which
+should only be used in a local testing environment.
+
+- Setting: **OPTIONAL**
+- Format: *boolean*
+- Example:
+  ```toml
+  UseDirectTLS=true
+  ```
+
+## NoStartTLS
+
+Disable StartTLS connection to your server. If you'd like to use direct TLS, enable
+the `UseDirectTLS` setting. Otherwise, a plaintext connection is established, which
+should only be used in a local testing environment.
+
+- Setting: **OPTIONAL**
+- Format: *boolean*
+- Example:
+  ```toml
+  NoStartTLS=true
   ```
 
 ## Password
@@ -81,3 +109,41 @@ XMPP server to connect to.
   ```toml
   Server="jabber.example.com:5222"
   ```
+
+## Mechanism
+
+Force an explicit SASL mechanism for authentication. This is a very advanced setting
+when debugging authentication problems and potential upstream go-xmpp authentication
+bugs. If you don't understand it, you don't need it.
+
+- Setting: **OPTIONAL**
+- Format: *string*
+- Example:
+  ```toml
+  Mechanism="PLAIN"
+  ```
+
+## NoPLAIN
+
+Prevent using `PLAIN` SASL authentication to the server. This is an advanced setting
+which is incompatible with many servers (eg. those using LDAP auth). When enabled,
+this setting will make sure your configured password is *never* sent to the server,
+only establishing a secure handshake such as [SCRAM](https://en.wikipedia.org/wiki/Salted_Challenge_Response_Authentication_Mechanism).
+
+- Setting: **OPTIONAL**
+- Format: *boolean*
+- Example:
+  ```toml
+  NoPLAIN=true
+  ```
+
+## WebhookURL
+
+> [!WARNING]
+> The `WebhookURL` setting has been removed. It was using a custom prosody
+> module [mod_slack_webhooks](https://modules.prosody.im/mod_slack_webhooks.html) which may
+> or may not still be functional, but is not documented to work with the latest prosody
+> releases.
+> 
+> If you are still successfully using this feature, please open an issue documenting
+> your setup so that we can support it again in the future.

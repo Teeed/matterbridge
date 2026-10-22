@@ -1,7 +1,13 @@
 package bridge
 
 import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
 	"log"
+	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +21,9 @@ type Bridger interface {
 	Connect() error
 	JoinChannel(channel config.ChannelInfo) error
 	Disconnect() error
+	NewHttpRequest(method, uri string, body io.Reader) (*http.Request, error)
+	NewHttpClient(proxy string) (*http.Client, error)
+	SanitizeNick(msg *config.Message) error // Ensure that a bridge will accept the relayed nick as valid
 }
 
 type Bridge struct {
@@ -30,6 +39,7 @@ type Bridge struct {
 	Log            *logrus.Entry
 	Config         config.Config
 	General        *config.Protocol
+	HttpClient     *http.Client // Unique HTTP settings per bridge
 }
 
 type Config struct {
@@ -41,6 +51,8 @@ type Config struct {
 // Factory is the factory function to create a bridge
 type Factory func(*Config) Bridger
 
+// New is a basic constructor. More important fields are populated
+// in gateway/gateway.go (AddBridge method).
 func New(bridge *config.Bridge) *Bridge {
 	accInfo := strings.Split(bridge.Account, ".")
 	if len(accInfo) != 2 {
@@ -66,24 +78,11 @@ func (b *Bridge) JoinChannels() error {
 
 // SetChannelMembers sets the newMembers to the bridge ChannelMembers
 func (b *Bridge) SetChannelMembers(newMembers *config.ChannelMembers) {
+	defer b.handlePanic()
+
 	b.Lock()
 	b.ChannelMembers = newMembers
 	b.Unlock()
-}
-
-func (b *Bridge) joinChannels(channels map[string]config.ChannelInfo, exists map[string]bool) error {
-	for ID, channel := range channels {
-		if !exists[ID] {
-			b.Log.Infof("%s: joining %s (ID: %s)", b.Account, channel.Name, ID)
-			time.Sleep(time.Duration(b.GetInt("JoinDelay")) * time.Millisecond)
-			err := b.JoinChannel(channel)
-			if err != nil {
-				return err
-			}
-			exists[ID] = true
-		}
-	}
-	return nil
 }
 
 func (b *Bridge) GetConfigKey(key string) string {
@@ -132,4 +131,318 @@ func (b *Bridge) GetStringSlice2D(key string) [][]string {
 		val, _ = b.Config.GetStringSlice2D("general." + key)
 	}
 	return val
+}
+
+func (b *Bridge) SetBool(key string, val bool) {
+	b.SetVal(b.GetConfigKey(key), val)
+}
+
+func (b *Bridge) SetInt(key string, val int) {
+	b.SetVal(b.GetConfigKey(key), val)
+}
+
+func (b *Bridge) SetString(key string, val string) {
+	b.SetVal(b.GetConfigKey(key), val)
+}
+
+func (b *Bridge) SetStringSlice(key string, val []string) {
+	b.SetVal(b.GetConfigKey(key), val)
+}
+
+func (b *Bridge) SetStringSlice2D(key string, val [][]string) {
+	b.SetVal(b.GetConfigKey(key), val)
+}
+
+// SetVal can be called with "general." prepended to the key instead of using
+// one of the above Set functions, to override a setting in the [general] section.
+func (b *Bridge) SetVal(key string, value any) {
+	b.Config.SetVal(key, value)
+}
+
+// NewHttpClient produces a single unified http.Client per bridge.
+//
+// This allows to have project-wide defaults (timeout) as well as
+// bridge-configurable values (`http_proxy`).
+//
+// This method is left public so that if that's needed, a bridge can
+// override this constructor.
+//
+// TODO: maybe protocols without HTTP downloads at all could override
+// this method and return nil? Or the other way around?
+func (b *Bridge) NewHttpClient(http_proxy string) (*http.Client, error) {
+	if http_proxy != "" {
+		proxyUrl, err := url.Parse(b.GetString("http_proxy"))
+		if err != nil {
+			return nil, err
+		}
+
+		b.Log.Debugf("%s using HTTP proxy %s", b.Protocol, proxyUrl)
+
+		return &http.Client{
+			Timeout:   time.Second * 15,
+			Transport: &http.Transport{Proxy: http.ProxyURL(proxyUrl)},
+		}, nil
+	}
+
+	b.Log.Debugf("%s not using HTTP proxy", b.Protocol)
+
+	return &http.Client{
+		Timeout: time.Second * 5,
+	}, nil
+}
+
+var errHttpGetNotOk = errors.New("HTTP server responded non-OK code")
+
+func HttpGetNotOkError(uri string, code int) error {
+	return fmt.Errorf("%w: %s returned code %d", errHttpGetNotOk, uri, code)
+}
+
+// HttpGetBytes returns bytes from a given URI, if the request
+// succeeds and HTTP response status is 200 (OK).
+func (b *Bridge) HttpGetBytes(uri string) (*[]byte, error) {
+	req, err := b.Bridger.NewHttpRequest("GET", uri, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	b.Log.Debugf("Getting HTTP bytes with request: %#v", req)
+
+	resp, err := b.HttpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, HttpGetNotOkError(uri, resp.StatusCode)
+	}
+
+	var buf bytes.Buffer
+
+	_, err = io.Copy(&buf, resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	err = resp.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	data := buf.Bytes()
+
+	return &data, nil
+}
+
+// HttpUpload uploads data to a URI, and validates the response status code.
+//
+// Params:
+//
+// - method: specific HTTP verb
+// - uri: remote URL
+// - headers: map of headers to insert in the request
+// - data: raw bytes to upload in the body
+// - ok_status: list of HTTP status codes considered successful (default: 200, 201)
+//
+// The response body is always discarded.
+func (b *Bridge) HttpUpload(method string, uri string, headers map[string]string, data *[]byte, ok_status []int) error {
+	req, err := b.Bridger.NewHttpRequest(method, uri, bytes.NewReader(*data))
+	if err != nil {
+		return err
+	}
+
+	for header_name, header_value := range headers {
+		req.Header.Set(header_name, header_value)
+	}
+
+	b.Log.Debugf("HTTP upload request: %v", req)
+
+	resp, err := b.HttpClient.Do(req)
+	if err != nil {
+		return err
+	}
+
+	err = resp.Body.Close()
+	if err != nil {
+		return err
+	}
+
+	// By default, allow codes 200 (OK) and 201 (CREATED)
+	if len(ok_status) == 0 {
+		ok_status = []int{200, 201}
+	}
+
+	for _, expected_code := range ok_status {
+		b.Log.Debugf("Successful file upload with code %d", expected_code)
+		return nil
+	}
+
+	return HttpGetNotOkError(uri, resp.StatusCode)
+}
+
+// AddAttachmentFromURL adds a file from a public URL.
+//
+// The data will be downloaded, and both the URL and the raw bytes will be
+// passed to other bridges. When media server is enabled, the content URL
+// will also be replaced by our own URL.
+func (b *Bridge) AddAttachmentFromURL(msg *config.Message, filename string, id string, comment string, uri string) error {
+	return b.addAttachment(msg, filename, id, comment, uri, nil, false)
+}
+
+// AddAttachmentFromProtectedURL adds a file from a private, protected URL.
+//
+// The data will be downloaded by the bridge, but only the raw bytes will be
+// passed to other bridges so that they don't relay broken URLs, such as
+// with Matrix authenticated media. When media server is URL, our new URL
+// will be inserted instead.
+func (b *Bridge) AddAttachmentFromProtectedURL(msg *config.Message, filename string, id string, comment string, uri string) error {
+	return b.addAttachmentNoURL(msg, filename, id, comment, uri, nil, false)
+}
+
+// AddAttachmentFromBytes adds a file from raw bytes.
+//
+// The data bytes will be passed to other bridges. If those bridges only
+// support URLs and not raw bytes upload:
+//
+// - if media server is enabled, matterbridge will produce a new URL
+// - otherwise, the message will be discarded by the remote bridge
+func (b *Bridge) AddAttachmentFromBytes(msg *config.Message, filename string, id string, comment string, data *[]byte) error {
+	return b.addAttachment(msg, filename, id, comment, "", data, false)
+}
+
+func (b *Bridge) AddAvatarFromURL(msg *config.Message, filename string, id string, comment string, uri string) error {
+	return b.addAttachment(msg, filename, id, comment, uri, nil, true)
+}
+
+func (b *Bridge) AddAvatarFromBytes(msg *config.Message, filename string, id string, comment string, data *[]byte) error {
+	return b.addAttachment(msg, filename, id, comment, "", data, true)
+}
+
+// NewHttpRequest produces a new http.Request instance with bridge-specific settings.
+//
+// This is used by bridges where HTTP downloads require a cookie/token, by overriding
+// this method in the bridge struct.
+func (b *Bridge) NewHttpRequest(method, uri string, body io.Reader) (*http.Request, error) {
+	return http.NewRequest(method, uri, body)
+}
+
+// TODO: add a check for whether any mutex locks are currently active (debug mode only)
+func (b *Bridge) handlePanic() {
+	rec := recover()
+	if rec != nil {
+		b.Log.Warnf("Recovered from panic: %#v", rec)
+	}
+}
+
+func (b *Bridge) joinChannels(channels map[string]config.ChannelInfo, exists map[string]bool) error {
+	for ID, channel := range channels {
+		if exists[ID] {
+			continue
+		}
+
+		b.Log.Infof("%s: joining %s (ID: %s)", b.Account, channel.Name, ID)
+		time.Sleep(time.Duration(b.GetInt("JoinDelay")) * time.Millisecond)
+
+		err := b.JoinChannel(channel)
+		if err != nil {
+			return err
+		}
+
+		exists[ID] = true
+	}
+
+	return nil
+}
+
+// Internal method including common parts to attachment/avatar handling methods.
+//
+// This method will process received bytes. If bytes are not set, they will be downloaded from the given URL.
+// If neither data bytes nor uri is provided, this will be a hard error because there's a logic error somewhere.
+func (b *Bridge) addAttachment(msg *config.Message, filename string, id string, comment string, uri string, data *[]byte, avatar bool) error {
+	if data != nil {
+		return b.addAttachmentProcess(msg, filename, id, comment, uri, data, avatar)
+	}
+
+	if uri == "" {
+		// This should never happen
+		b.Log.Fatalf("Logic error in bridge %s: attachment should have either URL or data set, neither was provided", b.Protocol)
+	}
+
+	data, err := b.HttpGetBytes(uri)
+	if err != nil {
+		return err
+	}
+
+	return b.addAttachmentProcess(msg, filename, id, comment, uri, data, avatar)
+}
+
+// Internal method similar to addAttachment, but will not keep the URL.
+//
+// This is useful so protected URLs requiring specific headers (such as matrix authenticated media)
+// can be downloaded, and then omitted so other bridges don't spread along broken URLs.
+func (b *Bridge) addAttachmentNoURL(msg *config.Message, filename string, id string, comment string, uri string, data *[]byte, avatar bool) error {
+	if data != nil {
+		return b.addAttachmentProcess(msg, filename, id, comment, "", data, avatar)
+	}
+
+	if uri == "" {
+		// This should never happen
+		b.Log.Fatalf("Logic error in bridge %s: attachment should have either URL or data set, neither was provided", b.Protocol)
+	}
+
+	data, err := b.HttpGetBytes(uri)
+	if err != nil {
+		return err
+	}
+
+	return b.addAttachmentProcess(msg, filename, id, comment, "", data, avatar)
+}
+
+type errFileTooLarge struct {
+	FileName string
+	Size     int
+	MaxSize  int
+}
+
+func (e *errFileTooLarge) Error() string {
+	return fmt.Sprintf("File %#v to large to download (%#v). MediaDownloadSize is %#v", e.FileName, e.Size, e.MaxSize)
+}
+
+type errFileBlacklisted struct {
+	FileName string
+}
+
+func (e *errFileBlacklisted) Error() string {
+	return fmt.Sprintf("File %#v matches the backlist, not downloading it", e.FileName)
+}
+
+func (b *Bridge) addAttachmentProcess(msg *config.Message, filename string, id string, comment string, uri string, data *[]byte, avatar bool) error {
+	size := len(*data)
+	if size > b.General.MediaDownloadSize {
+		return &errFileTooLarge{
+			FileName: filename,
+			Size:     size,
+			MaxSize:  b.General.MediaDownloadSize,
+		}
+	}
+
+	// Apply `MediaDownloadBlackList` regexes
+	if b.Config.IsFilenameBlacklisted(filename) {
+		return &errFileBlacklisted{
+			FileName: filename,
+		}
+	}
+
+	b.Log.Debugf("Download OK %#v %#v", filename, size)
+	msg.Extra["file"] = append(msg.Extra["file"], config.FileInfo{
+		Name:    filename,
+		Data:    data,
+		URL:     uri,
+		Comment: comment,
+		Avatar:  avatar,
+		// TODO: if id is not set, maybe use hash of bytes?
+		NativeID: id,
+		Size:     int64(len(*data)),
+	})
+
+	return nil
 }

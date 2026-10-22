@@ -2,31 +2,41 @@ package bslack
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
 
-	lru "github.com/hashicorp/golang-lru"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/matterbridge-org/matterbridge/bridge"
 	"github.com/matterbridge-org/matterbridge/bridge/config"
 	"github.com/matterbridge-org/matterbridge/bridge/helper"
 	"github.com/matterbridge-org/matterbridge/matterhook"
 	"github.com/rs/xid"
 	"github.com/slack-go/slack"
+	"github.com/slack-go/slack/socketmode"
 )
 
 type Bslack struct {
 	sync.RWMutex
 	*bridge.Config
 
-	mh  *matterhook.Client
-	sc  *slack.Client
-	rtm *slack.RTM
-	si  *slack.Info
+	mh *matterhook.Client
+	sc *slack.Client
 
-	cache        *lru.Cache
+	// legacy RTM connection
+	rtm *slack.RTM
+
+	// new socket based Events API connection
+	smc     *socketmode.Client
+	smcStop context.CancelFunc
+
+	actingUserID   string
+	actingUserName string
+
+	cache        *lru.Cache[string, any]
 	uuid         string
 	useChannelID bool
 
@@ -43,6 +53,7 @@ const (
 	sMemberJoined        = "member_joined_channel"
 	sMessageChanged      = "message_changed"
 	sMessageDeleted      = "message_deleted"
+	sMessageReplied      = "message_replied"
 	sSlackAttachment     = "slack_attachment"
 	sPinnedItem          = "pinned_item"
 	sUnpinnedItem        = "unpinned_item"
@@ -57,6 +68,7 @@ const (
 	cfileDownloadChannel = "file_download_channel"
 
 	tokenConfig           = "Token"
+	appTokenConfig        = "AppToken"
 	incomingWebhookConfig = "WebhookBindAddress"
 	outgoingWebhookConfig = "WebhookURL"
 	skipTLSConfig         = "SkipTLSVerify"
@@ -69,19 +81,29 @@ const (
 )
 
 func New(cfg *bridge.Config) bridge.Bridger {
-	// Print a deprecation warning for legacy non-bot tokens (#527).
 	token := cfg.GetString(tokenConfig)
+	appToken := cfg.GetString(appTokenConfig)
+	if appToken != "" && !strings.HasPrefix(appToken, "xapp-") {
+		cfg.Log.Error("App token missing `xapp-` prefix")
+	}
+	// Print a deprecation warning for legacy non-bot tokens (#527).
 	if token != "" && !strings.HasPrefix(token, "xoxb") {
 		cfg.Log.Warn("Non-bot token detected. It is STRONGLY recommended to use a proper bot-token instead.")
 		cfg.Log.Warn("Legacy tokens may be deprecated by Slack at short notice. See the Matterbridge GitHub wiki for a migration guide.")
 		cfg.Log.Warn("See https://github.com/42wim/matterbridge/wiki/Slack-bot-setup")
 		return NewLegacy(cfg)
 	}
+	// print warning for RTM + classic slack apps setup
+	if strings.HasPrefix(token, "xoxb-") && appToken == "" {
+		cfg.Log.Warn("Bot token with classic Slack apps setup detected.")
+		cfg.Log.Warn("It is recommended to use modern Slack apps with socket mode Events API instead.")
+		cfg.Log.Warn("See https://github.com/matterbridge-org/matterbridge/blob/master/docs/protocols/slack/account.md")
+	}
 	return newBridge(cfg)
 }
 
 func newBridge(cfg *bridge.Config) *Bslack {
-	newCache, err := lru.New(5000)
+	newCache, err := lru.New[string, any](5000)
 	if err != nil {
 		cfg.Log.Fatalf("Could not create LRU cache for Slack bridge: %v", err)
 	}
@@ -105,18 +127,31 @@ func (b *Bslack) Connect() error {
 		return errors.New("no connection method found: WebhookBindAddress, WebhookURL or Token need to be configured")
 	}
 
-	// If we have a token we use the Slack websocket-based RTM for both sending and receiving.
-	if token := b.GetString(tokenConfig); token != "" {
+	appToken := b.GetString(appTokenConfig)
+	token := b.GetString(tokenConfig)
+	debug := b.GetBool("Debug")
+
+	// If we have a token we use the Slack websocket-based RTM or Events API for both sending and receiving.
+	if token != "" {
 		b.Log.Info("Connecting using token")
 
-		b.sc = slack.New(token, slack.OptionDebug(b.GetBool("Debug")))
+		b.sc = slack.New(token, slack.OptionDebug(debug), slack.OptionAppLevelToken(appToken))
 
 		b.channels = newChannelManager(b.Log, b.sc)
 		b.users = newUserManager(b.Log, b.sc)
 
-		b.rtm = b.sc.NewRTM()
-		go b.rtm.ManageConnection()
+		// if app token is set then prefer using socketmode events rather than legacy RTM
+		if appToken != "" {
+			ctx, stop := context.WithCancel(context.Background())
+			b.smc = socketmode.New(b.sc, socketmode.OptionDebug(debug), socketmode.OptionLog(&smlog{b.Log}))
+			b.smcStop = stop
+			go b.startSocketEAPIConnection(ctx)
+		} else {
+			b.rtm = b.sc.NewRTM()
+			go b.rtm.ManageConnection()
+		}
 		go b.handleSlack()
+
 		return nil
 	}
 
@@ -142,7 +177,14 @@ func (b *Bslack) Connect() error {
 }
 
 func (b *Bslack) Disconnect() error {
-	return b.rtm.Disconnect()
+	if b.smc != nil {
+		b.smcStop()
+		return nil
+	}
+	if b.rtm != nil {
+		return b.rtm.Disconnect()
+	}
+	return nil
 }
 
 // JoinChannel only acts as a verification method that checks whether Matterbridge's
@@ -208,7 +250,7 @@ func (b *Bslack) Send(msg config.Message) (string, error) {
 	if b.GetString(outgoingWebhookConfig) != "" && b.GetString(tokenConfig) == "" {
 		return "", b.sendWebhook(msg)
 	}
-	return b.sendRTM(msg)
+	return b.sendAPI(msg)
 }
 
 // sendWebhook uses the configured WebhookURL to send the message
@@ -225,7 +267,6 @@ func (b *Bslack) sendWebhook(msg config.Message) error {
 	if msg.Extra != nil {
 		// This sends a message only if we received a config.EVENT_FILE_FAILURE_SIZE.
 		for _, rmsg := range helper.HandleExtra(&msg, b.General) {
-			rmsg := rmsg // scopelint
 			iconURL := config.GetIconURL(&rmsg, b.GetString(iconURLConfig))
 			matterMessage := matterhook.OMessage{
 				IconURL:  iconURL,
@@ -275,7 +316,7 @@ func (b *Bslack) sendWebhook(msg config.Message) error {
 	return nil
 }
 
-func (b *Bslack) sendRTM(msg config.Message) (string, error) {
+func (b *Bslack) sendAPI(msg config.Message) (string, error) {
 	// Handle channelmember messages.
 	if handled := b.handleGetChannelMembers(&msg); handled {
 		return "", nil
@@ -285,8 +326,10 @@ func (b *Bslack) sendRTM(msg config.Message) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("could not send message: %v", err)
 	}
+
+	// this one is RTM specific
 	if msg.Event == config.EventUserTyping {
-		if b.GetBool("ShowUserTyping") {
+		if b.GetBool("ShowUserTyping") && b.rtm != nil {
 			b.rtm.SendMessage(b.rtm.NewTypingMessage(channelInfo.ID))
 		}
 		return "", nil
@@ -339,15 +382,27 @@ func (b *Bslack) sendRTM(msg config.Message) (string, error) {
 	return b.postMessage(&msg, channelInfo)
 }
 
+func (b *Bslack) startSocketEAPIConnection(ctx context.Context) {
+	for {
+		err := b.smc.RunContext(ctx)
+		b.Log.Warnf("Slack socket mode client stopped with: %v", err)
+
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		time.Sleep(1 * time.Second)
+	}
+}
+
 func (b *Bslack) updateTopicOrPurpose(msg *config.Message, channelInfo *slack.Channel) error {
 	var updateFunc func(channelID string, value string) (*slack.Channel, error)
 
 	incomingChangeType, text := b.extractTopicOrPurpose(msg.Text)
 	switch incomingChangeType {
 	case "topic":
-		updateFunc = b.rtm.SetTopicOfConversation
+		updateFunc = b.sc.SetTopicOfConversation
 	case "purpose":
-		updateFunc = b.rtm.SetPurposeOfConversation
+		updateFunc = b.sc.SetPurposeOfConversation
 	default:
 		b.Log.Errorf("Unhandled type received from extractTopicOrPurpose: %s", incomingChangeType)
 		return nil
@@ -393,7 +448,7 @@ func (b *Bslack) deleteMessage(msg *config.Message, channelInfo *slack.Channel) 
 	}
 
 	for {
-		_, _, err := b.rtm.DeleteMessage(channelInfo.ID, msg.ID)
+		_, _, err := b.sc.DeleteMessage(channelInfo.ID, msg.ID)
 		if err == nil {
 			return true, nil
 		}
@@ -411,7 +466,7 @@ func (b *Bslack) editMessage(msg *config.Message, channelInfo *slack.Channel) (b
 	}
 	messageOptions := b.prepareMessageOptions(msg)
 	for {
-		_, _, _, err := b.rtm.UpdateMessage(channelInfo.ID, msg.ID, messageOptions...)
+		_, _, _, err := b.sc.UpdateMessage(channelInfo.ID, msg.ID, messageOptions...)
 		if err == nil {
 			return true, nil
 		}
@@ -430,7 +485,7 @@ func (b *Bslack) postMessage(msg *config.Message, channelInfo *slack.Channel) (s
 	}
 	messageOptions := b.prepareMessageOptions(msg)
 	for {
-		_, id, err := b.rtm.PostMessage(channelInfo.ID, messageOptions...)
+		_, id, err := b.sc.PostMessage(channelInfo.ID, messageOptions...)
 		if err == nil {
 			return id, nil
 		}
@@ -463,26 +518,34 @@ func (b *Bslack) uploadFile(msg *config.Message, channelID string) (string, erro
 		if fi.Comment != "" {
 			initialComment += fmt.Sprintf(" with comment: %s", fi.Comment)
 		}
-		res, err := b.sc.UploadFile(slack.FileUploadParameters{
+		res, err := b.sc.UploadFileV2(slack.UploadFileV2Parameters{
 			Reader:          bytes.NewReader(*fi.Data),
 			Filename:        fi.Name,
-			Channels:        []string{channelID},
+			FileSize:        len(*fi.Data),
+			Channel:         channelID,
 			InitialComment:  initialComment,
 			ThreadTimestamp: msg.ParentID,
 		})
 		if err != nil {
-			b.Log.Errorf("uploadfile %#v", err)
+			b.Log.Errorf("UploadFileV2 error %#v", err)
 			return "", err
 		}
 		if res.ID != "" {
+			// UploadFileV2 doesn't return the full slack.File info like the previous UploadFile, so query it separately
+			sfi, _, _, err := b.sc.GetFileInfo(res.ID, 0, 1)
+			if err != nil {
+				b.Log.Errorf("GetFileInfo uploaded error %#v", err)
+				return "", err
+			}
+
 			b.Log.Debugf("Adding file ID %s to cache with timestamp %s", res.ID, ts.String())
 			b.cache.Add("file"+res.ID, ts)
 
 			// search for message id by uploaded file in private/public channels, get thread timestamp from uploaded file
-			if v, ok := res.Shares.Private[channelID]; ok && len(v) > 0 {
+			if v, ok := sfi.Shares.Private[channelID]; ok && len(v) > 0 {
 				messageID = v[0].Ts
 			}
-			if v, ok := res.Shares.Public[channelID]; ok && len(v) > 0 {
+			if v, ok := sfi.Shares.Public[channelID]; ok && len(v) > 0 {
 				messageID = v[0].Ts
 			}
 		}
@@ -532,10 +595,13 @@ func (b *Bslack) prepareMessageOptions(msg *config.Message) []slack.MsgOption {
 	return opts
 }
 
-func (b *Bslack) createAttach(extra map[string][]interface{}) []slack.Attachment {
+func (b *Bslack) createAttach(extra map[string][]any) []slack.Attachment {
 	var attachements []slack.Attachment
 	for _, v := range extra["attachments"] {
-		entry := v.(map[string]interface{})
+		entry, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
 		s := slack.Attachment{
 			Fallback:   extractStringField(entry, "fallback"),
 			Color:      extractStringField(entry, "color"),
@@ -556,7 +622,7 @@ func (b *Bslack) createAttach(extra map[string][]interface{}) []slack.Attachment
 	return attachements
 }
 
-func extractStringField(data map[string]interface{}, field string) string {
+func extractStringField(data map[string]any, field string) string {
 	if rawValue, found := data[field]; found {
 		if value, ok := rawValue.(string); ok {
 			return value

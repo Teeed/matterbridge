@@ -1,12 +1,9 @@
 package bxmpp
 
 import (
-	"bytes"
 	"crypto/tls"
-	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +16,16 @@ import (
 	"github.com/xmppo/go-xmpp"
 )
 
+// UploadBufferEntry is data stored between requesting an upload,
+// and actually performing the upload.
+type UploadBufferEntry struct {
+	FileInfo    *config.FileInfo // Data received from other bridges
+	Mime        string           // Mimetype for the file upload
+	Description string           // Raw comment without authorship
+	Text        string           // Computed comment (including authorship) for the upload
+	To          string           // Room to send the upload announcement once completed
+}
+
 type Bxmpp struct {
 	*bridge.Config
 
@@ -30,6 +37,24 @@ type Bxmpp struct {
 
 	avatarAvailability map[string]bool
 	avatarMap          map[string]string
+
+	// The account's HTTP [upload component](https://xmpp.org/extensions/xep-0363.html#disco)
+	// is discovered in steps commented HTTP_UPLOAD_DISCO.
+	httpUploadComponent string
+	// The max attachment size is discovered in the last step of HTTP_UPLOAD_DISCO.
+	httpUploadMaxSize int64
+	// Files are stored in this buffer so we can perform the uploads asynchronously
+	// without blocking the main thread:
+	//
+	// - request an upload slot and store the file in the buffer (HTTP_UPLOAD_SLOT step 1)
+	// - (matterbridge processes other messages)
+	// - receive the upload slot and perform the HTTP upload (HTTP_UPLOAD_SLOT step 2)
+	// - (matterbridge processes other messages)
+	// - receive upload confirmation and post the OOB URL (HTTP_UPLOAD_SLOT step 3)
+	//
+	// Note that in most cases, remote bridges will provide an attachment URL, no file
+	// will actually be uploaded on XMPP side, and this buffer will be untouched.
+	httpUploadBuffer map[string]*UploadBufferEntry
 }
 
 func New(cfg *bridge.Config) bridge.Bridger {
@@ -38,10 +63,15 @@ func New(cfg *bridge.Config) bridge.Bridger {
 		xmppMap:            make(map[string]string),
 		avatarAvailability: make(map[string]bool),
 		avatarMap:          make(map[string]string),
+		httpUploadBuffer:   make(map[string]*UploadBufferEntry),
 	}
 }
 
 func (b *Bxmpp) Connect() error {
+	if b.GetString("WebhookURL") != "" {
+		b.Log.Fatalf("Slack-compatible WebhookURL has been deprecated. See docs/protocols/xmpp/settings.md")
+	}
+
 	b.Log.Infof("Connecting %s", b.GetString("Server"))
 	if err := b.createXMPP(); err != nil {
 		b.Log.Debugf("%#v", err)
@@ -51,6 +81,13 @@ func (b *Bxmpp) Connect() error {
 	b.Log.Info("Connection succeeded")
 	go b.manageConnection()
 	return nil
+}
+
+func (b *Bxmpp) Connected() bool {
+	b.RLock()
+	conn := b.connected
+	b.RUnlock()
+	return conn
 }
 
 func (b *Bxmpp) Disconnect() error {
@@ -92,36 +129,24 @@ func (b *Bxmpp) Send(msg config.Message) (string, error) {
 	// Upload a file (in XMPP case send the upload URL because XMPP has no native upload support).
 	var err error
 	if msg.Extra != nil {
+		// HandleExtra will produce error messages to be printed in the chat
+		// when the attachments are too big.
 		for _, rmsg := range helper.HandleExtra(&msg, b.General) {
 			b.Log.Debugf("=> Sending attachement message %#v", rmsg)
-			if b.GetString("WebhookURL") != "" {
-				err = b.postSlackCompatibleWebhook(msg)
-			} else {
-				_, err = b.xc.Send(xmpp.Chat{
-					Type:   "groupchat",
-					Remote: rmsg.Channel + "@" + b.GetString("Muc"),
-					Text:   rmsg.Username + rmsg.Text,
-				})
-			}
+			_, err = b.xc.Send(xmpp.Chat{
+				Type:   "groupchat",
+				Remote: rmsg.Channel + "@" + b.GetString("Muc"),
+				Text:   rmsg.Username + rmsg.Text,
+			})
 
 			if err != nil {
 				b.Log.WithError(err).Error("Unable to send message with share URL.")
 			}
 		}
 		if len(msg.Extra["file"]) > 0 {
-			return "", b.handleUploadFile(&msg)
+			b.handleUploadFile(&msg)
+			return "", nil
 		}
-	}
-
-	if b.GetString("WebhookURL") != "" {
-		b.Log.Debugf("Sending message using Webhook")
-		err := b.postSlackCompatibleWebhook(msg)
-		if err != nil {
-			b.Log.Errorf("Failed to send message using webhook: %s", err)
-			return "", err
-		}
-
-		return "", nil
 	}
 
 	// Post normal message.
@@ -140,31 +165,12 @@ func (b *Bxmpp) Send(msg config.Message) (string, error) {
 	return msgID, nil
 }
 
-func (b *Bxmpp) postSlackCompatibleWebhook(msg config.Message) error {
-	type XMPPWebhook struct {
-		Username string `json:"username"`
-		Text     string `json:"text"`
-	}
-	webhookBody, err := json.Marshal(XMPPWebhook{
-		Username: msg.Username,
-		Text:     msg.Text,
-	})
-	if err != nil {
-		b.Log.Errorf("Failed to marshal webhook: %s", err)
-		return err
-	}
-
-	resp, err := http.Post(b.GetString("WebhookURL")+"/"+url.QueryEscape(msg.Channel), "application/json", bytes.NewReader(webhookBody))
-	if err != nil {
-		b.Log.Errorf("Failed to POST webhook: %s", err)
-		return err
-	}
-
-	resp.Body.Close()
-	return nil
-}
-
 func (b *Bxmpp) createXMPP() error {
+	// TODO: remove in release after first community fork release (N+2)
+	if b.GetBool("NoTLS") {
+		b.Log.Fatalf("NoTLS setting has been deprecated. If you'd like to disable StartTLS and start a plaintext connection, use NoStartTLS instead.")
+	}
+
 	var serverName string
 	switch {
 	case !b.GetBool("Anonymous"):
@@ -187,16 +193,18 @@ func (b *Bxmpp) createXMPP() error {
 		Host:                         b.GetString("Server"),
 		User:                         b.GetString("Jid"),
 		Password:                     b.GetString("Password"),
-		NoTLS:                        true,
-		StartTLS:                     !b.GetBool("NoTLS"),
+		NoTLS:                        !b.GetBool("UseDirectTLS"),
+		StartTLS:                     !b.GetBool("NoStartTLS"),
 		TLSConfig:                    tc,
 		Debug:                        b.GetBool("debug"),
 		Session:                      true,
 		Status:                       "",
 		StatusMessage:                "",
 		Resource:                     "",
-		InsecureAllowUnencryptedAuth: b.GetBool("NoTLS"),
+		InsecureAllowUnencryptedAuth: !b.GetBool("UseDirectTLS") && b.GetBool("NoStartTLS"),
 		DebugWriter:                  b.Log.Writer(),
+		Mechanism:                    b.GetString("Mechanism"),
+		NoPLAIN:                      b.GetBool("NoPLAIN"),
 	}
 	var err error
 	b.xc, err = options.NewClient()
@@ -290,6 +298,12 @@ func (b *Bxmpp) handleXMPP() error {
 
 		switch v := m.(type) {
 		case xmpp.Chat:
+			if v.Type == "error" {
+				b.Log.Warn("Received error message from the server")
+				b.Log.Warnf("%#v", v)
+				continue
+			}
+
 			if v.Type == "groupchat" {
 				b.Log.Debugf("== Receiving %#v", v)
 
@@ -313,10 +327,11 @@ func (b *Bxmpp) handleXMPP() error {
 					avatar = getAvatar(b.avatarMap, v.Remote, b.General)
 				}
 
+				rnick, rchan := b.parseJID(v.Remote)
 				rmsg := config.Message{
-					Username: b.parseNick(v.Remote),
+					Username: rnick,
 					Text:     v.Text,
-					Channel:  b.parseChannel(v.Remote),
+					Channel:  rchan,
 					Account:  b.Account,
 					Avatar:   avatar,
 					UserID:   v.Remote,
@@ -324,6 +339,7 @@ func (b *Bxmpp) handleXMPP() error {
 					// as explained in XEP-0461 https://xmpp.org/extensions/xep-0461.html#business-id
 					ID:    v.StanzaID.ID,
 					Event: event,
+					Extra: make(map[string][]any),
 				}
 
 				// Check if we have an action event.
@@ -333,6 +349,9 @@ func (b *Bxmpp) handleXMPP() error {
 					rmsg.Event = config.EventUserAction
 				}
 
+				if b.handleDownloadFile(&rmsg, &v) {
+					continue
+				}
 				b.Log.Debugf("<= Sending message from %s on %s to gateway", rmsg.Username, b.Account)
 				b.Log.Debugf("<= Message is %#v", rmsg)
 				b.Remote <- rmsg
@@ -343,6 +362,72 @@ func (b *Bxmpp) handleXMPP() error {
 			b.Log.Debugf("Avatar for %s is now available", v.From)
 		case xmpp.Presence:
 			// Do nothing.
+		case xmpp.DiscoItems:
+			// Received a list of items, most likely from trying to find the HTTP upload server
+			// Send a disco info query to all items to find out which is which
+			//
+			// HTTP_UPLOAD_DISCO step 2
+			for _, item := range v.Items {
+				_, err := b.xc.DiscoverInfo(item.Jid)
+				if err != nil {
+					b.Log.WithError(err).Warnf("Failed to disco info from %s", item.Jid)
+				}
+			}
+		case xmpp.DiscoResult:
+			// Received disco info about a specific item, most likely from trying
+			// to find the HTTP upload server.
+			for _, identity := range v.Identities {
+				if identity.Type != "file" || identity.Category != "store" {
+					// Filter out disco info about everything else.
+					continue
+				}
+
+				// HTTP_UPLOAD_DISCO step 3
+				foundSize := b.extractMaxSizeFromX(&v.X)
+
+				b.Log.Debugf("Found HTTP file upload component %s (maximum size: %d)", v.From, foundSize)
+				b.Lock()
+				b.httpUploadComponent = v.From
+				b.httpUploadMaxSize = foundSize
+				b.Unlock()
+			}
+		case xmpp.Slot:
+			// HTTP_UPLOAD_SLOT step 2
+			b.Log.Debugf("Received upload slot ID %s", v.ID)
+			b.Lock()
+			entry, ok := b.httpUploadBuffer[v.ID]
+			b.Unlock()
+
+			if !ok {
+				b.Log.Warnf("Received upload slot ID %s doesn't match a known file", v.ID)
+				continue
+			}
+
+			b.Log.Debugf("Preparing to upload file %s to %s", entry.FileInfo.Name, v.Put.Url)
+
+			go func() {
+				headers := make(map[string]string)
+				headers["Content-Type"] = entry.Mime
+
+				for _, h := range v.Put.Headers {
+					switch h.Name {
+					case "Authorization", "Cookie", "Expires":
+						b.Log.Debugf("Setting header %s to %s", h.Name, h.Value)
+						headers[h.Name] = h.Value
+					default:
+						b.Log.Warnf("Unknown header from HTTP upload component: %s: %s", h.Name, h.Value)
+					}
+				}
+
+				err := b.HttpUpload(http.MethodPut, v.Put.Url, headers, entry.FileInfo.Data, []int{http.StatusOK, http.StatusCreated})
+				if err != nil {
+					b.Log.WithError(err).Warnf("Failed to upload file %s", entry.FileInfo.Name)
+				}
+
+				// Actually perform the chat announcement
+				// HTTP_UPLOAD_SLOT step 3
+				b.announceUploadedFile(entry.To, entry.Text, entry.Description, v.Get.Url)
+			}()
 		}
 	}
 }
@@ -354,67 +439,32 @@ func (b *Bxmpp) replaceAction(text string) (string, bool) {
 	return text, false
 }
 
-// handleUploadFile handles native upload of files
-func (b *Bxmpp) handleUploadFile(msg *config.Message) error {
-	var urlDesc string
-
-	for _, file := range msg.Extra["file"] {
-		fileInfo := file.(config.FileInfo)
-		if fileInfo.Comment != "" {
-			msg.Text += fileInfo.Comment + ": "
-		}
-		if fileInfo.URL != "" {
-			msg.Text = fileInfo.URL
-			if fileInfo.Comment != "" {
-				msg.Text = fileInfo.Comment + ": " + fileInfo.URL
-				urlDesc = fileInfo.Comment
-			}
-		}
-		if _, err := b.xc.Send(xmpp.Chat{
-			Type:   "groupchat",
-			Remote: msg.Channel + "@" + b.GetString("Muc"),
-			Text:   msg.Username + msg.Text,
-		}); err != nil {
-			return err
-		}
-
-		if fileInfo.URL != "" {
-			if _, err := b.xc.SendOOB(xmpp.Chat{
-				Type:    "groupchat",
-				Remote:  msg.Channel + "@" + b.GetString("Muc"),
-				Ooburl:  fileInfo.URL,
-				Oobdesc: urlDesc,
-			}); err != nil {
-				b.Log.WithError(err).Warn("Failed to send share URL.")
-			}
+// inspired by splitString() in mellium's jid.go
+//
+// only supports MUC JID formats (i.e. channel@server/nick) where the server is the only required part for a valid JID
+// "@" and "/" are allowed in the nick.  would need reworking to support MIX format
+func (b *Bxmpp) parseJID(remote string) (string, string) {
+	rnick, rchan := "", ""
+	s := strings.Index(remote, "/")
+	if s != -1 { // nick field (resourcepart) exists
+		if s != len(remote)-1 { // nick isn't empty
+			rnick = remote[s+1:]
+			remote = remote[:s]
 		}
 	}
-	return nil
-}
 
-func (b *Bxmpp) parseNick(remote string) string {
-	s := strings.Split(remote, "@")
-	if len(s) > 1 {
-		s = strings.Split(s[1], "/")
-		if len(s) == 2 {
-			return s[1] // nick
-		}
+	s = strings.Index(remote, "@")
+	if s > 0 { // -1 means no localpart, 0 means invalid empty localpart, anything else is the channel name
+		rchan = remote[:s]
 	}
-	return ""
-}
-
-func (b *Bxmpp) parseChannel(remote string) string {
-	s := strings.Split(remote, "@")
-	if len(s) >= 2 {
-		return s[0] // channel
-	}
-	return ""
+	return rnick, rchan
 }
 
 // skipMessage skips messages that need to be skipped
 func (b *Bxmpp) skipMessage(message xmpp.Chat) bool {
 	// skip messages from ourselves
-	if b.parseNick(message.Remote) == b.GetString("Nick") {
+	rnick, _ := b.parseJID(message.Remote)
+	if rnick == b.GetString("Nick") {
 		return true
 	}
 
@@ -440,11 +490,14 @@ func (b *Bxmpp) skipMessage(message xmpp.Chat) bool {
 func (b *Bxmpp) setConnected(state bool) {
 	b.Lock()
 	b.connected = state
-	defer b.Unlock()
-}
+	b.Unlock()
 
-func (b *Bxmpp) Connected() bool {
-	b.RLock()
-	defer b.RUnlock()
-	return b.connected
+	// We are now (re)connected, send a disco query to find out HTTP upload server
+	// Ignore any errors encountered
+	//
+	// HTTP_UPLOAD_DISCO step 1
+	_, err := b.xc.DiscoverServerItems()
+	if err != nil {
+		b.Log.WithError(err).Warn("Failed to discover server items")
+	}
 }

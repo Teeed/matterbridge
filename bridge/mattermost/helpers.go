@@ -11,6 +11,8 @@ import (
 	"github.com/mattermost/mattermost/server/public/model"
 )
 
+const systemUsername = "system"
+
 func (b *Bmattermost) doConnectWebhookBind() error {
 	switch {
 	case b.GetString("WebhookURL") != "":
@@ -124,14 +126,13 @@ func (b *Bmattermost) sendWebhook(msg config.Message) (string, error) {
 	if msg.Extra != nil {
 		// this sends a message only if we received a config.EVENT_FILE_FAILURE_SIZE
 		for _, rmsg := range helper.HandleExtra(&msg, b.General) {
-			rmsg := rmsg // scopelint
 			iconURL := config.GetIconURL(&rmsg, b.GetString("iconurl"))
 			matterMessage := matterhook.OMessage{
 				IconURL:  iconURL,
 				Channel:  rmsg.Channel,
 				UserName: rmsg.Username,
 				Text:     rmsg.Text,
-				Props:    make(map[string]interface{}),
+				Props:    make(map[string]any),
 			}
 			matterMessage.Props["matterbridge_"+b.uuid] = true
 			if err := b.mh.Send(matterMessage); err != nil {
@@ -156,7 +157,7 @@ func (b *Bmattermost) sendWebhook(msg config.Message) (string, error) {
 		Channel:  msg.Channel,
 		UserName: msg.Username,
 		Text:     msg.Text,
-		Props:    make(map[string]interface{}),
+		Props:    make(map[string]any),
 	}
 	if msg.Avatar != "" {
 		matterMessage.IconURL = msg.Avatar
@@ -176,9 +177,6 @@ func (b *Bmattermost) sendWebhook(msg config.Message) (string, error) {
 func (b *Bmattermost) skipMessage(message *matterclient.Message) bool {
 	// Handle join/leave
 	skipJoinMessageTypes := map[string]struct{}{
-		"system_join_leave":          {}, // deprecated for system_add_to_channel
-		"system_leave_channel":       {}, // deprecated for system_remove_from_channel
-		"system_join_channel":        {},
 		"system_add_to_channel":      {},
 		"system_remove_from_channel": {},
 		"system_add_to_team":         {},
@@ -197,13 +195,27 @@ func (b *Bmattermost) skipMessage(message *matterclient.Message) bool {
 			channelName = message.Channel
 		}
 
-		b.Log.Debugf("Sending JOIN_LEAVE event from %s to gateway", b.Account)
-		b.Remote <- config.Message{
-			Username: "system",
-			Text:     message.Text,
-			Channel:  channelName,
-			Account:  b.Account,
-			Event:    config.EventJoinLeave,
+		switch message.Type {
+		case "system_add_to_channel":
+			b.Log.Debugf("Sending JOIN event from %s to gateway", b.Account)
+
+			b.Remote <- config.Message{
+				Username: systemUsername,
+				Text:     message.Text,
+				Channel:  channelName,
+				Account:  b.Account,
+				Event:    config.EventJoin,
+			}
+		case "system_remove_from_channel":
+			b.Log.Debugf("Sending LEAVE event from %s to gateway", b.Account)
+
+			b.Remote <- config.Message{
+				Username: systemUsername,
+				Text:     message.Text,
+				Channel:  channelName,
+				Account:  b.Account,
+				Event:    config.EventLeave,
+			}
 		}
 		return true
 	}

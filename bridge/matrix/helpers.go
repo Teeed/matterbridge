@@ -1,15 +1,19 @@
 package bmatrix
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
-	"strings"
 	"time"
 
-	// Custom fork of unmaintained library, needs replacement:
-	matrix "github.com/matterbridge/gomatrix"
+	mautrix "maunium.net/go/mautrix"
+	/* trunk-ignore(golangci-lint2/typecheck) */
+	"maunium.net/go/mautrix/crypto"
+	"maunium.net/go/mautrix/crypto/cryptohelper"
+	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 )
 
 func newMatrixUsername(username string) *matrixUsername {
@@ -29,7 +33,7 @@ func newMatrixUsername(username string) *matrixUsername {
 }
 
 // getRoomID retrieves a matching room ID from the channel name.
-func (b *Bmatrix) getRoomID(channel string) string {
+func (b *Bmatrix) getRoomID(channel string) id.RoomID {
 	b.RLock()
 	defer b.RUnlock()
 	for ID, name := range b.RoomMap {
@@ -41,47 +45,37 @@ func (b *Bmatrix) getRoomID(channel string) string {
 	return ""
 }
 
-// interface2Struct marshals and immediately unmarshals an interface.
-// Useful for converting map[string]interface{} to a struct.
-func interface2Struct(in interface{}, out interface{}) error {
-	jsonObj, err := json.Marshal(in)
-	if err != nil {
-		return err //nolint:wrapcheck
-	}
-
-	return json.Unmarshal(jsonObj, out)
-}
-
 // getDisplayName retrieves the displayName for mxid, querying the homeserver if the mxid is not in the cache.
-func (b *Bmatrix) getDisplayName(mxid string) string {
+func (b *Bmatrix) getDisplayName(ctx context.Context, mxid id.UserID) string {
+	// Localpart is the user name. Return it if UseUserName is set.
 	if b.GetBool("UseUserName") {
-		return mxid[1:]
+		return mxid.Localpart()
 	}
 
 	b.RLock()
-	if val, present := b.NicknameMap[mxid]; present {
+
+	if val, present := b.NicknameMap[mxid.Localpart()]; present {
 		b.RUnlock()
 
 		return val.displayName
 	}
+
 	b.RUnlock()
 
-	displayName, err := b.mc.GetDisplayName(mxid)
-	var httpError *matrix.HTTPError
-	if errors.As(err, &httpError) {
-		b.Log.Warnf("Couldn't retrieve the display name for %s", mxid)
-	}
-
+	resp, err := b.mc.GetDisplayName(ctx, mxid)
 	if err != nil {
-		return b.cacheDisplayName(mxid, mxid[1:])
+		b.Log.Errorf("Retrieving the display name for %s failed: %s", mxid, err)
+
+		// Return the user name since retrieving the display name failed
+		return b.cacheDisplayName(mxid, mxid.Localpart())
 	}
 
-	return b.cacheDisplayName(mxid, displayName.DisplayName)
+	return b.cacheDisplayName(mxid, resp.DisplayName)
 }
 
 // cacheDisplayName stores the mapping between a mxid and a display name, to be reused later without performing a query to the homserver.
 // Note that old entries are cleaned when this function is called.
-func (b *Bmatrix) cacheDisplayName(mxid string, displayName string) string {
+func (b *Bmatrix) cacheDisplayName(mxid id.UserID, displayName string) string {
 	now := time.Now()
 
 	// scan to delete old entries, to stop memory usage from becoming too high with old entries.
@@ -90,7 +84,8 @@ func (b *Bmatrix) cacheDisplayName(mxid string, displayName string) string {
 	conflict := false
 
 	b.Lock()
-	for mxid, v := range b.NicknameMap {
+
+	for localpart, v := range b.NicknameMap {
 		// to prevent username reuse across matrix servers - or even on the same server, append
 		// the mxid to the username when there is a conflict
 		if v.displayName == displayName {
@@ -98,11 +93,11 @@ func (b *Bmatrix) cacheDisplayName(mxid string, displayName string) string {
 			// TODO: it would be nice to be able to rename previous messages from this user.
 			// The current behavior is that only users with clashing usernames and *that have spoken since the bridge last started* will get their mxids shown, and I don't know if that's the expected behavior.
 			v.displayName = fmt.Sprintf("%s (%s)", displayName, mxid)
-			b.NicknameMap[mxid] = v
+			b.NicknameMap[localpart] = v
 		}
 
 		if now.Sub(v.lastUpdated) > 10*time.Minute {
-			toDelete = append(toDelete, mxid)
+			toDelete = append(toDelete, localpart)
 		}
 	}
 
@@ -114,7 +109,7 @@ func (b *Bmatrix) cacheDisplayName(mxid string, displayName string) string {
 		delete(b.NicknameMap, v)
 	}
 
-	b.NicknameMap[mxid] = NicknameCacheEntry{
+	b.NicknameMap[mxid.Localpart()] = NicknameCacheEntry{
 		displayName: displayName,
 		lastUpdated: now,
 	}
@@ -124,10 +119,8 @@ func (b *Bmatrix) cacheDisplayName(mxid string, displayName string) string {
 }
 
 // handleError converts errors into httpError.
-//
-//nolint:exhaustivestruct
 func handleError(err error) *httpError {
-	var mErr matrix.HTTPError
+	var mErr mautrix.HTTPError
 	if !errors.As(err, &mErr) {
 		return &httpError{
 			Err: "not a HTTPError",
@@ -136,7 +129,8 @@ func handleError(err error) *httpError {
 
 	var httpErr httpError
 
-	if err := json.Unmarshal(mErr.Contents, &httpErr); err != nil {
+	err = json.Unmarshal([]byte(mErr.ResponseBody), &httpErr)
+	if err != nil {
 		return &httpError{
 			Err: "unmarshal failed",
 		}
@@ -145,16 +139,17 @@ func handleError(err error) *httpError {
 	return &httpErr
 }
 
-func (b *Bmatrix) containsAttachment(content map[string]interface{}) bool {
+func (b *Bmatrix) containsAttachment(content event.Content) bool {
 	// Skip empty messages
-	if content["msgtype"] == nil {
+	if content.AsMessage().MsgType == "" {
 		return false
 	}
 
 	// Only allow image,video or file msgtypes
-	if !(content["msgtype"].(string) == "m.image" ||
-		content["msgtype"].(string) == "m.video" ||
-		content["msgtype"].(string) == "m.file") {
+	if content.AsMessage().MsgType != event.MsgImage &&
+		content.AsMessage().MsgType != event.MsgVideo &&
+		content.AsMessage().MsgType != event.MsgAudio &&
+		content.AsMessage().MsgType != event.MsgFile {
 		return false
 	}
 
@@ -162,21 +157,15 @@ func (b *Bmatrix) containsAttachment(content map[string]interface{}) bool {
 }
 
 // getAvatarURL returns the avatar URL of the specified sender.
-func (b *Bmatrix) getAvatarURL(sender string) string {
-	urlPath := b.mc.BuildURL("profile", sender, "avatar_url")
-
-	s := struct {
-		AvatarURL string `json:"avatar_url"`
-	}{}
-
-	err := b.mc.MakeRequest("GET", urlPath, nil, &s)
+func (b *Bmatrix) getAvatarURL(ctx context.Context, sender id.UserID) string {
+	urlPath, err := b.mc.GetAvatarURL(ctx, sender)
 	if err != nil {
 		b.Log.Errorf("getAvatarURL failed: %s", err)
 
 		return ""
 	}
 
-	url := strings.ReplaceAll(s.AvatarURL, "mxc://", b.GetString("Server")+"/_matrix/media/r0/thumbnail/")
+	url := b.mc.BuildClientURL(urlPath)
 	if url != "" {
 		url += "?width=37&height=37&method=crop"
 	}
@@ -214,4 +203,52 @@ func (b *Bmatrix) retry(f func() error) error {
 			return nil
 		}
 	}
+}
+
+// Use this function to set up your client for E2EE
+func setupEncryptedClientHelper(client *mautrix.Client, pickleKey []byte, sessionFile string) (*cryptohelper.CryptoHelper, error) {
+	// The cryptohelper manages the creation of the correct CryptoStore and StateStore implementations.
+	ch, err := cryptohelper.NewCryptoHelper(client, pickleKey, sessionFile)
+	if err != nil {
+		// This usually catches errors with opening the database file or key issues.
+		return nil, fmt.Errorf("failed to create crypto helper: %w", err)
+	}
+
+	// Init MUST be called to load data from the database and prepare the internal machine.
+	err = ch.Init(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize crypto helper: %w", err)
+	}
+
+	// Hook the helper into the client
+	client.Crypto = ch
+
+	return ch, nil
+}
+
+// Verifies your recovery key with Matrix so you can message unimpeded
+func verifyWithRecoveryKey(ctx context.Context, machine *crypto.OlmMachine, recoveryKey string) error {
+	keyId, keyData, err := machine.SSSS.GetDefaultKeyData(ctx)
+	if err != nil {
+		return err
+	}
+
+	key, err := keyData.VerifyRecoveryKey(keyId, recoveryKey)
+	if err != nil {
+		return err
+	}
+
+	err = machine.FetchCrossSigningKeysFromSSSS(ctx, key)
+	if err != nil {
+		return err
+	}
+
+	err = machine.SignOwnDevice(ctx, machine.OwnIdentity())
+	if err != nil {
+		return err
+	}
+
+	err = machine.SignOwnMasterKey(ctx)
+
+	return err
 }

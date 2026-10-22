@@ -1,6 +1,3 @@
-//go:build whatsappmulti
-// +build whatsappmulti
-
 package bwhatsapp
 
 import (
@@ -18,7 +15,7 @@ import (
 )
 
 // nolint:gocritic
-func (b *Bwhatsapp) eventHandler(evt interface{}) {
+func (b *Bwhatsapp) eventHandler(evt any) {
 	switch e := evt.(type) {
 	case *events.Message:
 		b.handleMessage(e)
@@ -50,7 +47,7 @@ func (b *Bwhatsapp) handleUserJoin(event *events.GroupInfo) {
 			Channel:  event.JID.String(),
 			Account:  b.Account,
 			Protocol: b.Protocol,
-			Event:    config.EventJoinLeave,
+			Event:    config.EventJoin,
 			Text:     "joined chat",
 		}
 
@@ -68,7 +65,7 @@ func (b *Bwhatsapp) handleUserLeave(event *events.GroupInfo) {
 			Channel:  event.JID.String(),
 			Account:  b.Account,
 			Protocol: b.Protocol,
-			Event:    config.EventJoinLeave,
+			Event:    config.EventLeave,
 			Text:     "left chat",
 		}
 
@@ -180,7 +177,7 @@ func (b *Bwhatsapp) handleTextMessage(messageInfo types.MessageInfo, msg *proto.
 		Channel:  channel.String(),
 		Account:  b.Account,
 		Protocol: b.Protocol,
-		Extra:    make(map[string][]interface{}),
+		Extra:    make(map[string][]any),
 		ID:       getMessageIdFormat(senderJID, messageInfo.ID),
 		ParentID: parentID,
 	}
@@ -213,7 +210,7 @@ func (b *Bwhatsapp) handleImageMessage(msg *events.Message) {
 		Channel:  msg.Info.Chat.String(),
 		Account:  b.Account,
 		Protocol: b.Protocol,
-		Extra:    make(map[string][]interface{}),
+		Extra:    make(map[string][]any),
 		ID:       getMessageIdFormat(senderJID, msg.Info.ID),
 		ParentID: getParentIdFromCtx(ci),
 	}
@@ -277,7 +274,7 @@ func (b *Bwhatsapp) handleVideoMessage(msg *events.Message) {
 		Channel:  msg.Info.Chat.String(),
 		Account:  b.Account,
 		Protocol: b.Protocol,
-		Extra:    make(map[string][]interface{}),
+		Extra:    make(map[string][]any),
 		ID:       getMessageIdFormat(senderJID, msg.Info.ID),
 		ParentID: getParentIdFromCtx(ci),
 	}
@@ -300,7 +297,7 @@ func (b *Bwhatsapp) handleVideoMessage(msg *events.Message) {
 	// Prefer .mp4 extension, otherwise fallback to first index
 	fileExtIndex := 0
 	for i, n := range fileExt {
-		if ".mp4" == n {
+		if n == ".mp4" {
 			fileExtIndex = i
 			break
 		}
@@ -343,7 +340,7 @@ func (b *Bwhatsapp) handleAudioMessage(msg *events.Message) {
 		Channel:  msg.Info.Chat.String(),
 		Account:  b.Account,
 		Protocol: b.Protocol,
-		Extra:    make(map[string][]interface{}),
+		Extra:    make(map[string][]any),
 		ID:       getMessageIdFormat(senderJID, msg.Info.ID),
 		ParentID: getParentIdFromCtx(ci),
 	}
@@ -401,7 +398,7 @@ func (b *Bwhatsapp) handleDocumentMessage(msg *events.Message) {
 		Channel:  msg.Info.Chat.String(),
 		Account:  b.Account,
 		Protocol: b.Protocol,
-		Extra:    make(map[string][]interface{}),
+		Extra:    make(map[string][]any),
 		ID:       getMessageIdFormat(senderJID, msg.Info.ID),
 		ParentID: getParentIdFromCtx(ci),
 	}

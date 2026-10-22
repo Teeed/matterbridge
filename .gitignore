@@ -4,6 +4,7 @@
 
 # Exclude configuration file
 matterbridge.toml
+*.db*
 
 # Exclude IDE Files
 .vscode
@@ -14,3 +15,4 @@ matterbridge.toml
 # OS files
 .DS_Store
 *~
+\#*#

@@ -3,18 +3,19 @@ package gateway
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/d5/tengo/v2"
 	"github.com/d5/tengo/v2/stdlib"
-	lru "github.com/hashicorp/golang-lru"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/kyokomi/emoji/v2"
 	"github.com/matterbridge-org/matterbridge/bridge"
 	"github.com/matterbridge-org/matterbridge/bridge/config"
+	"github.com/matterbridge-org/matterbridge/gateway/bridgemap"
 	"github.com/matterbridge-org/matterbridge/internal"
 	"github.com/sirupsen/logrus"
 )
@@ -23,14 +24,14 @@ type Gateway struct {
 	config.Config
 
 	Router         *Router
-	mediaServer    mediaServer
 	MyConfig       *config.Gateway
 	Bridges        map[string]*bridge.Bridge
 	Channels       map[string]*config.ChannelInfo
 	ChannelOptions map[string]config.ChannelOptions
 	Message        chan config.Message
 	Name           string
-	Messages       *lru.Cache
+	Messages       *lru.Cache[string, []*BrMsgID]
+	mediaServer    mediaServer
 
 	logger *logrus.Entry
 }
@@ -42,6 +43,78 @@ type BrMsgID struct {
 }
 
 const apiProtocol = "api"
+const ircProtocol = "irc"
+
+// AddBridge sets up a new bridge on startup.
+//
+// It's added in the gateway object with the specified configuration, and is
+// not triggered again on config change.
+func (gw *Gateway) AddBridge(cfg *config.Bridge) error {
+	br := gw.Router.getBridge(cfg.Account)
+	if br == nil {
+		gw.checkConfig(cfg)
+		br = bridge.New(cfg)
+		br.Config = gw.Router.Config
+		br.General = &gw.BridgeValues().General
+		br.Log = gw.logger.WithFields(logrus.Fields{"prefix": br.Protocol})
+
+		// Instantiate bridge's HTTP client
+		http_client, err := br.NewHttpClient(br.GetString("http_proxy"))
+		if err != nil {
+			br.Log.Fatalf("config failure for account %s, HTTP settings incorrect", br.Account)
+		}
+
+		br.HttpClient = http_client
+
+		brconfig := &bridge.Config{
+			Remote: gw.Message,
+			Bridge: br,
+		}
+		// add the actual bridger for this protocol to this bridge using the bridgeMap
+		if _, ok := gw.Router.BridgeMap[br.Protocol]; !ok {
+			gw.logger.Fatalf("Incorrect protocol %s specified in gateway configuration %s, exiting.", br.Protocol, cfg.Account)
+		}
+		br.Bridger = gw.Router.BridgeMap[br.Protocol](brconfig)
+	}
+	gw.mapChannelsToBridge(br)
+	gw.Bridges[cfg.Account] = br
+	return nil
+}
+
+// AddConfig associates a new configuration with the gateway object.
+func (gw *Gateway) AddConfig(cfg *config.Gateway) error {
+	gw.Name = cfg.Name
+	gw.MyConfig = cfg
+	if err := gw.mapChannels(); err != nil {
+		gw.logger.Errorf("mapChannels() failed: %s", err)
+	}
+	for _, br := range append(gw.MyConfig.In, append(gw.MyConfig.InOut, gw.MyConfig.Out...)...) {
+		err := gw.AddBridge(&br)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// FindCanonicalMsgID returns the ID under which a message was stored in the cache.
+func (gw *Gateway) FindCanonicalMsgID(protocol string, mID string) string {
+	ID := protocol + " " + mID
+	if gw.Messages.Contains(ID) {
+		return ID
+	}
+
+	// If not keyed, iterate through cache for downstream, and infer upstream.
+	for _, mid := range gw.Messages.Keys() {
+		ids, _ := gw.Messages.Peek(mid)
+		for _, downstreamMsgObj := range ids {
+			if ID == downstreamMsgObj.ID {
+				return mid
+			}
+		}
+	}
+	return ""
+}
 
 // New creates a new Gateway object associated with the specified router and
 // following the given configuration.
@@ -60,7 +133,7 @@ func New(rootLogger *logrus.Logger, cfg *config.Gateway, r *Router) *Gateway {
 		}
 	}
 
-	cache, _ := lru.New(5000)
+	cache, _ := lru.New[string, []*BrMsgID](5000)
 	gw := &Gateway{
 		Channels:    make(map[string]*config.ChannelInfo),
 		Message:     r.Message,
@@ -71,56 +144,119 @@ func New(rootLogger *logrus.Logger, cfg *config.Gateway, r *Router) *Gateway {
 		logger:      logger,
 		mediaServer: mediaServerInstance,
 	}
-	if err := gw.AddConfig(cfg); err != nil {
+	err = gw.AddConfig(cfg)
+	if err != nil {
 		logger.Errorf("Failed to add configuration to gateway: %#v", err)
 	}
 	return gw
 }
 
-// FindCanonicalMsgID returns the ID under which a message was stored in the cache.
-func (gw *Gateway) FindCanonicalMsgID(protocol string, mID string) string {
-	ID := protocol + " " + mID
-	if gw.Messages.Contains(ID) {
-		return ID
-	}
-
-	// If not keyed, iterate through cache for downstream, and infer upstream.
-	for _, mid := range gw.Messages.Keys() {
-		v, _ := gw.Messages.Peek(mid)
-		ids := v.([]*BrMsgID)
-		for _, downstreamMsgObj := range ids {
-			if ID == downstreamMsgObj.ID {
-				return mid.(string)
-			}
+// SendMessage sends a message (with specified parentID) to the channel on the selected
+// destination bridge and returns a message ID or an error.
+func (gw *Gateway) SendMessage( //nolint:gocyclo,funlen
+	rmsg *config.Message,
+	dest *bridge.Bridge,
+	channel *config.ChannelInfo,
+	canonicalParentMsgID string,
+) (string, error) {
+	msg := *rmsg
+	// Only send the avatar download event to ourselves.
+	if msg.Event == config.EventAvatarDownload {
+		if channel.ID != getChannelID(rmsg) {
+			return "", nil
+		}
+	} else {
+		// do not send to ourself for any other event
+		if channel.ID == getChannelID(rmsg) {
+			return "", nil
 		}
 	}
-	return ""
+
+	// Too noisy to log like other events
+	debugSendMessage := ""
+
+	switch msg.Event {
+	case config.EventNoticeIRC: // Only send irc notices to IRC
+		if dest.Protocol != ircProtocol {
+			return "", nil
+		}
+	case config.EventUserTyping:
+		break
+	case config.EventFileDelete: // exclude file delete event as the msg ID here is the native file ID that needs to be deleted
+		break
+	default:
+		debugSendMessage = fmt.Sprintf("=> Sending %#v from %s (%s) to %s (%s)", msg, msg.Account, rmsg.Channel, dest.Account, channel.Name)
+		msg.ID = gw.getDestMsgID(rmsg.Protocol+" "+rmsg.ID, dest, channel)
+	}
+
+	if dest.Protocol == apiProtocol {
+		msg.Channel = rmsg.Channel // for api we need originchannel as channel
+	} else {
+		msg.Channel = channel.Name
+	}
+
+	gw.modifyAvatar(&msg, dest)
+	errNick := gw.modifyUsername(&msg, dest)
+
+	if errNick != nil && !dest.GetBool("UseRelayFallback") { // We are trying to send to an IRC bridge using RELAYMSG.
+		gw.logger.Debugf("=> UseRelayFallback=false and got error from modifyUsername: %s", errNick)
+		gw.logger.Debugf("=> Dropping %#v from %s (%s) to %s (%s)", msg, msg.Account, rmsg.Channel, dest.Account, channel.Name)
+		// We either switched to a fallback nick, or are dropping the message.
+		return "", errNick
+	}
+
+	msg.ParentID = gw.getDestMsgID(canonicalParentMsgID, dest, channel)
+	if msg.ParentID == "" {
+		msg.ParentID = strings.Replace(canonicalParentMsgID, dest.Protocol+" ", "", 1)
+	}
+
+	// if the parentID is still empty and we have a parentID set in the original message
+	// this means that we didn't find it in the cache so set it to a "msg-parent-not-found" constant
+	if msg.ParentID == "" && rmsg.ParentID != "" {
+		msg.ParentID = config.ParentIDNotFound
+	}
+
+	drop, err := gw.modifyOutMessageTengo(rmsg, &msg, dest)
+	if err != nil {
+		gw.logger.Errorf("modifySendMessageTengo: %s", err)
+	}
+
+	if drop {
+		gw.logger.Debugf("=> Tengo dropping %#v from %s (%s) to %s (%s)", msg, msg.Account, rmsg.Channel, dest.Account, channel.Name)
+		return "", nil
+	}
+
+	if debugSendMessage != "" {
+		gw.logger.Debug(debugSendMessage)
+	}
+
+	// if we are using mattermost plugin account, send messages to MattermostPlugin channel
+	// that can be picked up by the mattermost matterbridge plugin
+	if dest.Account == "mattermost.plugin" {
+		gw.Router.MattermostPlugin <- msg
+	}
+
+	defer func(t time.Time) {
+		gw.logger.Debugf("=> Send from %s (%s) to %s (%s) took %s", msg.Account, rmsg.Channel, dest.Account, channel.Name, time.Since(t))
+	}(time.Now())
+
+	mID, err := dest.Send(msg)
+	if err != nil {
+		return mID, err
+	}
+
+	// append the message ID (mID) from this bridge (dest) to our brMsgIDs slice
+	// append has been moved to handlers.go
+	if mID != "" {
+		gw.logger.Debugf("mID %s: %s", dest.Account, mID)
+		return mID, nil
+	}
+	return "", nil
 }
 
-// AddBridge sets up a new bridge in the gateway object with the specified configuration.
-func (gw *Gateway) AddBridge(cfg *config.Bridge) error {
-	br := gw.Router.getBridge(cfg.Account)
-	if br == nil {
-		gw.checkConfig(cfg)
-		br = bridge.New(cfg)
-		br.Config = gw.Router.Config
-		br.General = &gw.BridgeValues().General
-		br.Log = gw.logger.WithFields(logrus.Fields{"prefix": br.Protocol})
-		brconfig := &bridge.Config{
-			Remote: gw.Message,
-			Bridge: br,
-		}
-		// add the actual bridger for this protocol to this bridge using the bridgeMap
-		if _, ok := gw.Router.BridgeMap[br.Protocol]; !ok {
-			gw.logger.Fatalf("Incorrect protocol %s specified in gateway configuration %s, exiting.", br.Protocol, cfg.Account)
-		}
-		br.Bridger = gw.Router.BridgeMap[br.Protocol](brconfig)
-	}
-	gw.mapChannelsToBridge(br)
-	gw.Bridges[cfg.Account] = br
-	return nil
-}
-
+// checkConfig checks a bridge config, on startup.
+//
+// This is not triggered when config is reloaded from disk.
 func (gw *Gateway) checkConfig(cfg *config.Bridge) {
 	match := false
 	for _, key := range gw.Router.Config.Viper().AllKeys() {
@@ -132,23 +268,6 @@ func (gw *Gateway) checkConfig(cfg *config.Bridge) {
 	if !match {
 		gw.logger.Fatalf("Account %s defined in gateway %s but no configuration found, exiting.", cfg.Account, gw.Name)
 	}
-}
-
-// AddConfig associates a new configuration with the gateway object.
-func (gw *Gateway) AddConfig(cfg *config.Gateway) error {
-	gw.Name = cfg.Name
-	gw.MyConfig = cfg
-	if err := gw.mapChannels(); err != nil {
-		gw.logger.Errorf("mapChannels() failed: %s", err)
-	}
-	for _, br := range append(gw.MyConfig.In, append(gw.MyConfig.InOut, gw.MyConfig.Out...)...) {
-		br := br // scopelint
-		err := gw.AddBridge(&br)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func (gw *Gateway) mapChannelsToBridge(br *bridge.Bridge) {
@@ -233,7 +352,9 @@ func (gw *Gateway) getDestChannel(msg *config.Message, dest bridge.Bridge) []con
 	}
 
 	// discord join/leave is for the whole bridge, isn't a per channel join/leave
-	if msg.Event == config.EventJoinLeave && getProtocol(msg) == "discord" && msg.Channel == "" {
+	if (msg.Event == config.EventJoinLeave || msg.Event == config.EventJoin || msg.Event == config.EventLeave) &&
+		getProtocol(msg) == "discord" &&
+		msg.Channel == "" {
 		for _, channel := range gw.Channels {
 			if channel.Account == dest.Account && strings.Contains(channel.Direction, "out") &&
 				gw.validGatewayDest(msg) {
@@ -274,8 +395,7 @@ func (gw *Gateway) getDestChannel(msg *config.Message, dest bridge.Bridge) []con
 }
 
 func (gw *Gateway) getDestMsgID(msgID string, dest *bridge.Bridge, channel *config.ChannelInfo) string {
-	if res, ok := gw.Messages.Get(msgID); ok {
-		IDs := res.([]*BrMsgID)
+	if IDs, ok := gw.Messages.Get(msgID); ok {
 		for _, id := range IDs {
 			// check protocol, bridge name and channelname
 			// for people that reuse the same bridge multiple times. see #342
@@ -322,7 +442,7 @@ func (gw *Gateway) ignoreMessage(msg *config.Message) bool {
 }
 
 // ignoreFilesComment returns true if we need to ignore a file with matched comment.
-func (gw *Gateway) ignoreFilesComment(extra map[string][]interface{}, igMessages []string) bool {
+func (gw *Gateway) ignoreFilesComment(extra map[string][]any, igMessages []string) bool {
 	if extra == nil {
 		return false
 	}
@@ -338,11 +458,26 @@ func (gw *Gateway) ignoreFilesComment(extra map[string][]interface{}, igMessages
 	return false
 }
 
-func (gw *Gateway) modifyUsername(msg *config.Message, dest *bridge.Bridge) string {
-	if dest.GetBool("StripNick") {
+func (gw *Gateway) modifyUsername(msg *config.Message, dest *bridge.Bridge) error { //nolint:gocyclo,funlen
+	// fix for upstream issue #2043 was written by github user adbenitez
+	// this prevents StripNick (and now also Colornicks) from being applied to the original msg,
+	// and thereby potentially affecting subsequent bridges which lack those settings.
+	// https://github.com/adbenitez/matterbridge/tree/adb/issue-2043
+	//
+	// TODO: When used, StripNick can possibly enable impersonation attacks, as a user can join the same
+	// channel with a similar nick but with a special character in it, which would then get stripped out;
+	// such would be obvious to the other local users on that channel, but from any remote bridge's point of view,
+	// the two users would have the same nick.  Perhaps we can log a warning when there is a collision like that?
+	if dest.GetBool("StripNick") { // Sanitize nick so that it contains nothing but alphanumeric characters
 		re := regexp.MustCompile("[^a-zA-Z0-9]+")
 		msg.Username = re.ReplaceAllString(msg.Username, "")
+	} else if dest.Protocol == ircProtocol && !dest.GetBool("UseRelayMsg") && dest.GetBool("Colornicks") {
+		// Colornicks is currently only available for IRC, but it's not compatible with Relaymsg.
+		// If we didn't strip the nick, then we'll swap any spaces with NBSP's.
+		// This is only needed for the Colornicks setting to function.
+		msg.Username = strings.ReplaceAll(msg.Username, " ", "\u00A0")
 	}
+
 	nick := dest.GetString("RemoteNickFormat")
 
 	// loop to replace nicks
@@ -359,7 +494,11 @@ func (gw *Gateway) modifyUsername(msg *config.Message, dest *bridge.Bridge) stri
 		msg.Username = re.ReplaceAllString(msg.Username, replace)
 	}
 
-	if len(msg.Username) > 0 {
+	if dest.GetBool("UseRelayMsg") && !dest.GetBool("Colornicks") && len(msg.Username) > 0 && strings.Contains(nick, "{NOPINGNICK}") {
+		nick = strings.ReplaceAll(nick, "{NOPINGNICK}", msg.Username)
+
+		gw.logger.Warnf("{NOPINGNICK} in RemoteNickFormat is incompatible with UseRelayMsg, falling back to {NICK} on %s", dest.Account)
+	} else {
 		// fix utf-8 issue #193
 		i := 0
 		for index := range msg.Username {
@@ -384,16 +523,74 @@ func (gw *Gateway) modifyUsername(msg *config.Message, dest *bridge.Bridge) stri
 		gw.logger.Errorf("modifyUsernameTengo error: %s", err)
 	}
 	nick = strings.ReplaceAll(nick, "{TENGO}", tengoNick)
-	return nick
+
+	msg.Username = nick
+
+	_, ok := bridgemap.SanitizeNickSupport[dest.Protocol] // irc only, for now.  other bridges can be added to gateway/bridgemap/ files
+	if !ok {
+		return nil // No further sanitizing supported
+	}
+
+	switch dest.Protocol {
+	case ircProtocol: // Check that we actually want to sanitize the nick - for irc, that's only needed for RelayMsg
+		if dest.GetBool("Colornicks") || !dest.GetBool("UseRelayMsg") {
+			// Colornicks and UseRelayMsg are mutually exclusive settings
+			return nil
+		}
+
+		collisioncheck := dest.GetString("RemoteNickFormat") // Prevent an attacker from impersonating an IRC user's formatted and sanitized nick
+
+		if collisioncheck != "" { // Empty the nick format of all untrusted-input values, leaving potential RELAYMSG separator values
+			collisioncheck = strings.ReplaceAll(collisioncheck, "{NOPINGNICK}", "")
+			collisioncheck = strings.ReplaceAll(collisioncheck, "{BRIDGE}", br.Name)
+			collisioncheck = strings.ReplaceAll(collisioncheck, "{PROTOCOL}", br.Protocol)
+			collisioncheck = strings.ReplaceAll(collisioncheck, "{GATEWAY}", gw.Name)
+			collisioncheck = strings.ReplaceAll(collisioncheck, "{LABEL}", br.GetString("Label"))
+			collisioncheck = strings.ReplaceAll(collisioncheck, "{NICK}", "")
+			collisioncheck = strings.ReplaceAll(collisioncheck, "{USERID}", "")
+			collisioncheck = strings.ReplaceAll(collisioncheck, "{CHANNEL}", "")
+			collisioncheck = strings.ReplaceAll(collisioncheck, "{TENGO}", "")
+		}
+
+		mysep := dest.GetString("RelayMsgSep")
+		if mysep == "" {
+			gw.logger.Debugf("Got empty RelayMsgSep for %s", dest.Account)
+
+			mysep = "/"                          // Forward-slash and tilde are the defaults for Ergo and go-discord-irc
+			dest.SetString("RelayMsgSep", mysep) // This guess will hopefully get overwritten with a proper value from the server.
+		} // It's possible that we just recently connected and haven't finished cap negotiation.
+		// Best practice is to include the correct separator(s) in RemoteNickFormat
+		if !strings.ContainsAny(collisioncheck, mysep) {
+			// A separator char is not optional.  Maybe a slash will work
+			proto, _ := utf8.DecodeRuneInString(br.Protocol) // get first rune in string
+			sepr, _ := utf8.DecodeRuneInString(mysep)
+			msg.Username += string(sepr) + string(proto)
+			gw.logger.Debugf("No matching separators in RemoteNickFormat, trying to guess.\n >> Currently relaying pre-sanitized nick: %s", msg.Username)
+		}
+
+		goto SANITIZE
+
+	default:
+		gw.logger.Debugf("This shouldn't happen")
+	}
+
+SANITIZE:
+	err = dest.SanitizeNick(msg)
+
+	if err != nil { // We got an error, so we either switched to the fallback nick, or are canceling this msg send.
+		// TODO: Do this using context.Cancel instead of returning an error
+		gw.logger.Errorf("SanitizeNick error on %s: %s", dest.Account, err)
+	}
+
+	return err
 }
 
-func (gw *Gateway) modifyAvatar(msg *config.Message, dest *bridge.Bridge) string {
+func (gw *Gateway) modifyAvatar(msg *config.Message, dest *bridge.Bridge) {
 	iconurl := dest.GetString("IconURL")
 	iconurl = strings.ReplaceAll(iconurl, "{NICK}", msg.Username)
 	if msg.Avatar == "" {
 		msg.Avatar = iconurl
 	}
-	return msg.Avatar
 }
 
 func (gw *Gateway) modifyMessage(msg *config.Message) {
@@ -443,100 +640,6 @@ func (gw *Gateway) modifyMessage(msg *config.Message) {
 	}
 }
 
-// SendMessage sends a message (with specified parentID) to the channel on the selected
-// destination bridge and returns a message ID or an error.
-func (gw *Gateway) SendMessage(
-	rmsg *config.Message,
-	dest *bridge.Bridge,
-	channel *config.ChannelInfo,
-	canonicalParentMsgID string,
-) (string, error) {
-	msg := *rmsg
-	// Only send the avatar download event to ourselves.
-	if msg.Event == config.EventAvatarDownload {
-		if channel.ID != getChannelID(rmsg) {
-			return "", nil
-		}
-	} else {
-		// do not send to ourself for any other event
-		if channel.ID == getChannelID(rmsg) {
-			return "", nil
-		}
-	}
-
-	// Only send irc notices to irc
-	if msg.Event == config.EventNoticeIRC && dest.Protocol != "irc" {
-		return "", nil
-	}
-
-	// Too noisy to log like other events
-	debugSendMessage := ""
-	if msg.Event != config.EventUserTyping {
-		debugSendMessage = fmt.Sprintf("=> Sending %#v from %s (%s) to %s (%s)", msg, msg.Account, rmsg.Channel, dest.Account, channel.Name)
-	}
-
-	msg.Channel = channel.Name
-	msg.Avatar = gw.modifyAvatar(rmsg, dest)
-	msg.Username = gw.modifyUsername(rmsg, dest)
-
-	// exclude file delete event as the msg ID here is the native file ID that needs to be deleted
-	if msg.Event != config.EventFileDelete {
-		msg.ID = gw.getDestMsgID(rmsg.Protocol+" "+rmsg.ID, dest, channel)
-	}
-
-	// for api we need originchannel as channel
-	if dest.Protocol == apiProtocol {
-		msg.Channel = rmsg.Channel
-	}
-
-	msg.ParentID = gw.getDestMsgID(canonicalParentMsgID, dest, channel)
-	if msg.ParentID == "" {
-		msg.ParentID = strings.Replace(canonicalParentMsgID, dest.Protocol+" ", "", 1)
-	}
-
-	// if the parentID is still empty and we have a parentID set in the original message
-	// this means that we didn't find it in the cache so set it to a "msg-parent-not-found" constant
-	if msg.ParentID == "" && rmsg.ParentID != "" {
-		msg.ParentID = config.ParentIDNotFound
-	}
-
-	drop, err := gw.modifyOutMessageTengo(rmsg, &msg, dest)
-	if err != nil {
-		gw.logger.Errorf("modifySendMessageTengo: %s", err)
-	}
-
-	if drop {
-		gw.logger.Debugf("=> Tengo dropping %#v from %s (%s) to %s (%s)", msg, msg.Account, rmsg.Channel, dest.Account, channel.Name)
-		return "", nil
-	}
-
-	if debugSendMessage != "" {
-		gw.logger.Debug(debugSendMessage)
-	}
-	// if we are using mattermost plugin account, send messages to MattermostPlugin channel
-	// that can be picked up by the mattermost matterbridge plugin
-	if dest.Account == "mattermost.plugin" {
-		gw.Router.MattermostPlugin <- msg
-	}
-
-	defer func(t time.Time) {
-		gw.logger.Debugf("=> Send from %s (%s) to %s (%s) took %s", msg.Account, rmsg.Channel, dest.Account, channel.Name, time.Since(t))
-	}(time.Now())
-
-	mID, err := dest.Send(msg)
-	if err != nil {
-		return mID, err
-	}
-
-	// append the message ID (mID) from this bridge (dest) to our brMsgIDs slice
-	if mID != "" {
-		gw.logger.Debugf("mID %s: %s", dest.Account, mID)
-		return mID, nil
-		// brMsgIDs = append(brMsgIDs, &BrMsgID{dest, dest.Protocol + " " + mID, channel.ID})
-	}
-	return "", nil
-}
-
 func (gw *Gateway) validGatewayDest(msg *config.Message) bool {
 	return msg.Gateway == gw.Name
 }
@@ -578,7 +681,8 @@ func modifyInMessageTengo(filename string, msg *config.Message) error {
 	if filename == "" {
 		return nil
 	}
-	res, err := ioutil.ReadFile(filename)
+
+	res, err := os.ReadFile(filename) //nolint:gosec
 	if err != nil {
 		return err
 	}
@@ -606,7 +710,8 @@ func (gw *Gateway) modifyUsernameTengo(msg *config.Message, br *bridge.Bridge) (
 	if filename == "" {
 		return "", nil
 	}
-	res, err := ioutil.ReadFile(filename)
+
+	res, err := os.ReadFile(filename) //nolint:gosec
 	if err != nil {
 		return "", err
 	}
@@ -622,6 +727,8 @@ func (gw *Gateway) modifyUsernameTengo(msg *config.Message, br *bridge.Bridge) (
 	_ = s.Add("channel", msg.Channel)
 	_ = s.Add("msgProtocol", msg.Protocol)
 	_ = s.Add("remoteAccount", br.Account)
+	_ = s.Add("msgEvent", msg.Event)
+	_ = s.Add("label", br.GetString("Label"))
 	_ = s.Add("protocol", br.Protocol)
 	_ = s.Add("bridge", br.Name)
 	_ = s.Add("gateway", gw.Name)
@@ -649,7 +756,7 @@ func (gw *Gateway) modifyOutMessageTengo(origmsg *config.Message, msg *config.Me
 			return drop, err
 		}
 	} else {
-		res, err = ioutil.ReadFile(filename)
+		res, err = os.ReadFile(filename) //nolint:gosec
 		if err != nil {
 			return drop, err
 		}
