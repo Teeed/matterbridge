@@ -160,6 +160,7 @@ type Protocol struct {
 	MediaDownloadPath      string // Write upload to a file on the same server.
 	MediaDownloadSize      int    // all protocols
 	MediaServerDownload    string
+	MediaServerUpload      string
 	MediaConvertTgs        string     // telegram
 	MediaConvertWebPToPNG  bool       // telegram
 	MessageDelay           int        // IRC, time in millisecond to wait between messages
@@ -231,6 +232,13 @@ type Protocol struct {
 	VerboseJoinPart        bool       // IRC
 	WebhookBindAddress     string     // mattermost, slack
 	WebhookURL             string     // mattermost, slack
+
+	S3Endpoint       string // general, mediaserver configuration
+	S3AccessKey      string // general, mediaserver configuration
+	S3SecretKey      string // general, mediaserver configuration
+	S3ForcePathStyle bool   // general, mediaserver configuration
+	S3Presign        bool   // general, mediaserver configuration
+	S3Region         string // general, mediaserver configuration
 }
 
 type ChannelOptions struct {

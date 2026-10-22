@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
@@ -30,6 +31,7 @@ type Gateway struct {
 	Message        chan config.Message
 	Name           string
 	Messages       *lru.Cache[string, []*BrMsgID]
+	mediaServer    mediaServer
 
 	logger *logrus.Entry
 }
@@ -119,17 +121,30 @@ func (gw *Gateway) FindCanonicalMsgID(protocol string, mID string) string {
 func New(rootLogger *logrus.Logger, cfg *config.Gateway, r *Router) *Gateway {
 	logger := rootLogger.WithFields(logrus.Fields{"prefix": "gateway"})
 
+	mediaServerInstance, err := createMediaServer(r.BridgeValues(), rootLogger.WithField("prefix", "mediaserver"))
+	if err != nil {
+		if errors.Is(err, ErrMediaConfigurationNotWanted) {
+			// media server not wanted, ignore
+			mediaServerInstance = nil
+
+			logger.Info("Media server not configured, skipping media server setup")
+		} else {
+			logger.WithError(err).Error("Failed to configure media server for gateway")
+		}
+	}
+
 	cache, _ := lru.New[string, []*BrMsgID](5000)
 	gw := &Gateway{
-		Channels: make(map[string]*config.ChannelInfo),
-		Message:  r.Message,
-		Router:   r,
-		Bridges:  make(map[string]*bridge.Bridge),
-		Config:   r.Config,
-		Messages: cache,
-		logger:   logger,
+		Channels:    make(map[string]*config.ChannelInfo),
+		Message:     r.Message,
+		Router:      r,
+		Bridges:     make(map[string]*bridge.Bridge),
+		Config:      r.Config,
+		Messages:    cache,
+		logger:      logger,
+		mediaServer: mediaServerInstance,
 	}
-	err := gw.AddConfig(cfg)
+	err = gw.AddConfig(cfg)
 	if err != nil {
 		logger.Errorf("Failed to add configuration to gateway: %#v", err)
 	}

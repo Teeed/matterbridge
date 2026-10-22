@@ -3,7 +3,6 @@ package gateway
 import (
 	"crypto/sha1" //nolint:gosec
 	"fmt"
-	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -68,7 +67,8 @@ func (gw *Gateway) handleFiles(msg *config.Message) {
 	reg := regexp.MustCompile("[^a-zA-Z0-9]+")
 
 	// If we don't have a attachfield or we don't have a mediaserver configured return
-	if msg.Extra == nil || gw.BridgeValues().General.MediaDownloadPath == "" {
+	if msg.Extra == nil ||
+		gw.mediaServer == nil {
 		return
 	}
 
@@ -86,44 +86,21 @@ func (gw *Gateway) handleFiles(msg *config.Message) {
 
 		sha1sum := fmt.Sprintf("%x", sha1.Sum(*fi.Data))[:8] //nolint:gosec
 
-		// Use MediaServerPath. Place the file on the current filesystem.
-		err := gw.handleFilesLocal(&fi)
+		downloadURL, err := gw.mediaServer.handleFilesUpload(&fi)
 		if err != nil {
 			gw.logger.Error(err)
 			continue
 		}
 
 		// Download URL.
-		durl := gw.BridgeValues().General.MediaServerDownload + "/" + sha1sum + "/" + fi.Name
-
-		gw.logger.Debugf("mediaserver download URL = %s", durl)
+		gw.logger.Debugf("mediaserver download URL = %s", downloadURL)
 
 		// We uploaded/placed the file successfully. Add the SHA and URL.
 		extra := msg.Extra["file"][i].(config.FileInfo)
-		extra.URL = durl
+		extra.URL = downloadURL
 		extra.SHA = sha1sum
 		msg.Extra["file"][i] = extra
 	}
-}
-
-// handleFilesLocal use MediaServerPath configuration, places the file on the current filesystem.
-// Returns error on failure.
-func (gw *Gateway) handleFilesLocal(fi *config.FileInfo) error {
-	sha1sum := fmt.Sprintf("%x", sha1.Sum(*fi.Data))[:8] //nolint:gosec
-	dir := gw.BridgeValues().General.MediaDownloadPath + "/" + sha1sum
-	err := os.Mkdir(dir, os.ModePerm)
-	if err != nil && !os.IsExist(err) {
-		return fmt.Errorf("mediaserver path failed, could not mkdir: %s %#v", err, err)
-	}
-
-	path := dir + "/" + fi.Name
-	gw.logger.Debugf("mediaserver path placing file: %s", path)
-
-	err = os.WriteFile(path, *fi.Data, os.ModePerm) //nolint:gosec
-	if err != nil {
-		return fmt.Errorf("mediaserver path failed, could not writefile: %s %#v", err, err)
-	}
-	return nil
 }
 
 // ignoreEvent returns true if we need to ignore this event for the specified destination bridge.
