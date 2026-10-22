@@ -1,8 +1,14 @@
 > [!NOTE]
-> This is a community-maintained fork [42wim/matterbridge](https://github.com/42wim/matterbridge), because
+> This is a my own maintaned fork of [42wim/matterbridge](https://github.com/42wim/matterbridge), because
 > there is not a lot of activity upstream and lots of bugfixes were not merged.
 >
-> **Get involved now and [become a maintainer for your favorite network/protocol](https://github.com/matterbridge-org/community/issues/1)!**
+> Later there came [matterbridge-org/matterbridge](https://github.com/matterbridge-org/matterbridge) but their incompetence
+> and lack of will to get educated were stronger than their will to do something good.
+>
+> What this repo is basically doing is tracking [matterbridge-org/matterbridge](https://github.com/matterbridge-org/matterbridge)
+> and applying some of my changes (S3 mediastore) which were not merged for over a year.
+>
+> **If you want to contribute, please try [here](https://github.com/matterbridge-org/matterbridge) to the "new" "upstream" repo.**
 
 <div align="center">
 
@@ -10,93 +16,24 @@
 
 ![Matterbridge Logo](img/matterbridge-notext.gif)<br />
 **A simple chat bridge**<br />
-Letting people be where they want to be with the magic of [interoperability](https://en.wikipedia.org/wiki/Interoperability).<br />
-
----
-
-[![Download stable](https://img.shields.io/github/release/42wim/matterbridge.svg?label=download%20stable)](https://github.com/matterbridge-org/matterbridge/releases/latest)
-
----
 
 </div>
 
-matterbridge is a solution to connect users on different platforms/protocols, allowing them to chat in the best conditions possible. Despite the name, Matter<em>most</em> isn't required to run matter<em>bridge</em>.
+---
 
-> [!WARNING]
-> This fork has edited the history of the project to remove ~100MB of vendoring.
-> This will faciliate review of new PRs, see [community/#5](https://github.com/matterbridge-org/community/issues/5)
-> for the reasons why we did this and how to make sure we didn't introduce backdoors in this process.
+For deployment use docker image (ghcr.io/teeed/matterbridge:master or version with specific tag ghcr.io/teeed/matterbridge:v1.0.0). You could verify signature using [cosign](https://github.com/sigstore/cosign). For master branch you could use. For tags change following command appropriately:
+```
+cosign verify \
+  --certificate-identity=https://github.com/Teeed/matterbridge/.github/workflows/docker-publish.yml@refs/heads/master \
+  --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+  ghcr.io/teeed/matterbridge:master
+```
 
-## Features
 
-Many features are available, but not all of them are supported on all protocols:
+---
 
-- [x] Bridge many rooms from supported protocols
-- [x] Message threads/topics, and replies
-- [x] Attachments, file uploads, and inline images
-- [x] Transparent bridging with spoofed usernames and avatars
-- [x] Private groups
+## Extra features added 
 
-**The complete and up-to-date list of supported protocols is in [docs/protocols/](docs/protocols/).** Additionally, we have an [API for 3rd party integration](https://github.com/42wim/matterbridge/wiki/Features#api) if you'd like to add a custom bridge without implementing it in this codebase.
+- [x] S3 Mediaserver
+- [x] Signed docker releases, build by github workflow
 
-![Screenshot of users discussing from different networks using matterbridge](https://user-images.githubusercontent.com/849975/52647227-9c3a5300-2ee4-11e9-9c57-ea096473aba8.png)
-
-## Getting started with matterbridge
-
-Get matterbridge up-and-running in a few minutes in 3 simple steps:
-
-- [Setting up matterbridge](docs/setup.md) (see [docs/compiling.md](docs/compiling.md) for compiling from source)
-- [Configuring matterbridge](docs/config.md)
-- [Running matterbridge](docs/running.md) (CLI or as a systemd service)
-
-## Documentation
-
-See [docs/](docs/) folder in this repository.
-
-## Contributing
-
-You are welcome to submit pull requests, report bugs and request new features. matterbridge is a volunteer-run project and you are expected to behave with respect for the maintainers and other users. In particular, harassment and hate speech are not welcome.
-
-For more development guidelines, see [docs/development/](docs/development/).
-
-### Version policy
-
-matterbridge requires go 1.26. The required go version may be bumped at any time, but we will always wait at least 1 month after a golang release before bumping our requirements.
-
-While we would like to support older golang releases in order to target older distros, the problem is we have many upstream dependencies with many different versioning policies. go has no LTS version, and promises backwards-compatibility. See [this issue](https://github.com/matterbridge-org/matterbridge/issues/203) for more discussion on the topic.
-
-Please note it is still possible to compile matterbridge on stable distros such as Debian stable, just not with the distro-packaged compiler. You will need to use official golang binaries, or nix/guix packages, etc.
-
-### License
-
-This project is licensed under the [GNU AGPLv3 license](LICENSE) since after commit `20988f6446c6ad3ea416044712e634d3ed85ee53`. It was relicensed following discussion in [commmunity/#10](https://github.com/matterbridge-org/community/issues/10). Apart from the obvious advantages of copyleft to promote innovation and cooperation, in very practical terms, we had to use either `GPL` or `AGPL` to include the `whatsappmulti` bridge in official builds and deprecate the broken legacy `whatsapp` bridge. When contributing to matterbridge development, you agree that your contributions will be published under that license.
-
-Commits up-to `20988f6446c6ad3ea416044712e634d3ed85ee53` remain available under the looser [Apache License 2.0](LICENSE.old). 
-
-### Chat with us
-
-Questions or want to see the bridge in action? Join us on:
-
-- federated networks: [Jabber/XMPP][mb-xmpp], [Matrix][mb-matrix]
-- non-free centralized networks: [Discord][mb-discord]
-- self-hostable centralized networks: #matterbridge on `irc.f-hub.org:6697` or [Libera.chat][mb-irc]
-- Other: [Telegram](https://t.me/Matterbridge)
-
-## Related projects
-
-- [jwflory/ansible-role-matterbridge](https://galaxy.ansible.com/jwflory/matterbridge) (Ansible role to simplify deploying Matterbridge)
-- [matterbridge autoconfig](https://github.com/patcon/matterbridge-autoconfig)
-- [matterbridge config viewer](https://github.com/patcon/matterbridge-heroku-viewer)
-- [matterbridge-heroku](https://github.com/cadecairos/matterbridge-heroku)
-- [mattermost-plugin](https://github.com/matterbridge/mattermost-plugin) - Run matterbridge as a plugin in mattermost
-
-## Thanks
-
-Matterbridge wouldn't exist without amazing libraries, without [@42wim](https://github.com/42wim) who started the project, and without the 100+ contributors who participated in this adventure. See [docs/credits.md](docs/credits.md) for more complete credits.
-
-<!-- Links -->
-
-[mb-discord]: https://discord.gg/c9Ht6UTnQU
-[mb-irc]: https://web.libera.chat/#matterbridge
-[mb-matrix]: https://matrix.to/#/#matterbridge:matrix.f-hub.org
-[mb-xmpp]: xmpp:matterbridge@chat.f-hub.org?join
