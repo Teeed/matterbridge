@@ -6,10 +6,12 @@ import (
 	"crypto/sha1" //nolint:gosec
 	"errors"
 	"fmt"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -236,6 +238,28 @@ func (h *localMediaServer) handleFilesUpload(fi *config.FileInfo) (string, error
 	return h.httpDownloadPrefix + "/" + path.Join(sha1sum, fi.Name), nil
 }
 
+func guessContentType(filename string) string {
+	ext := filepath.Ext(filename)
+	if ext == "" {
+		return "application/octet-stream"
+	}
+
+	contentType := mime.TypeByExtension(ext)
+	if contentType == "" {
+		return "application/octet-stream"
+	}
+
+	// For security reasons, we want to force text/* content types to be served as text/plain with UTF-8 encoding.
+	// (to prevent HTML injection attacks, XSS, etc.)
+	//
+	// TODO: Do this really is a robust solution?
+	if strings.HasPrefix(contentType, "text/") {
+		return "text/plain; charset=utf-8"
+	}
+
+	return contentType
+}
+
 // handleFilesUpload which uploads media to s3 compatible server.
 // Returns error on failure.
 func (h *s3MediaServer) handleFilesUpload(fi *config.FileInfo) (string, error) {
@@ -250,7 +274,7 @@ func (h *s3MediaServer) handleFilesUpload(fi *config.FileInfo) (string, error) {
 		Key:           aws.String(key),
 		Body:          bytes.NewReader(*fi.Data),
 		ContentLength: aws.Int64(objectSize),
-		ContentType:   aws.String("application/octet-stream"),
+		ContentType:   aws.String(guessContentType(fi.Name)),
 	})
 	if err != nil {
 		return "", fmt.Errorf("%w: mediaserver s3 PutObject failed: %w", errUploadFailed, err)
