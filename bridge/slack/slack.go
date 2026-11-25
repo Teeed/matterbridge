@@ -518,7 +518,7 @@ func (b *Bslack) uploadFile(msg *config.Message, channelID string) (string, erro
 		if fi.Comment != "" {
 			initialComment += fmt.Sprintf(" with comment: %s", fi.Comment)
 		}
-		res, err := b.sc.UploadFileV2(slack.UploadFileV2Parameters{
+		res, err := b.sc.UploadFile(slack.UploadFileParameters{
 			Reader:          bytes.NewReader(*fi.Data),
 			Filename:        fi.Name,
 			FileSize:        len(*fi.Data),
@@ -527,11 +527,11 @@ func (b *Bslack) uploadFile(msg *config.Message, channelID string) (string, erro
 			ThreadTimestamp: msg.ParentID,
 		})
 		if err != nil {
-			b.Log.Errorf("UploadFileV2 error %#v", err)
+			b.Log.Errorf("UploadFile error %#v", err)
 			return "", err
 		}
 		if res.ID != "" {
-			// UploadFileV2 doesn't return the full slack.File info like the previous UploadFile, so query it separately
+			// UploadFile doesn't return the full slack.File info like the previous UploadFile, so query it separately
 			sfi, _, _, err := b.sc.GetFileInfo(res.ID, 0, 1)
 			if err != nil {
 				b.Log.Errorf("GetFileInfo uploaded error %#v", err)
